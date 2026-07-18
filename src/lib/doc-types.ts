@@ -18,7 +18,8 @@ export type BlockType =
   | "footnote" // inline footnote marker + footnote text (rendered below main content)
   | "toc" // auto-generated table of contents
   | "glossary" // auto-detected English-word glossary
-  | "pageBreak"; // manual page break
+  | "pageBreak" // manual page break
+  | "bismillah"; // centered invocation "به نام یزدان" — large, full-line
 
 export type FontSize = "sm" | "md" | "lg" | "xl";
 export type BlockWidth = "full" | "wide" | "medium" | "narrow";
@@ -128,6 +129,24 @@ export interface PageBreakBlock extends BaseBlock {
   type: "pageBreak";
 }
 
+// "Bismillah" block — a centered invocation. Renders as a large, ornamental
+// line of text (default "به نام یزدان") centered both horizontally and vertically
+// in its own row. The text is user-editable, and the appearance is configurable:
+//   - size:        "sm" | "md" | "lg" | "xl" | "xxl"  (default "lg")
+//   - color:       any CSS color                       (default "#0c1a3b")
+//   - showOrnament: boolean                            (default true)
+//   - ornament:    decorative char, e.g. "۞", "✦", "❖"  (default "۞")
+export type BismillahSize = "sm" | "md" | "lg" | "xl" | "xxl";
+
+export interface BismillahBlock extends BaseBlock {
+  type: "bismillah";
+  text: string; // default: "به نام یزدان"
+  size?: BismillahSize;
+  color?: string;
+  showOrnament?: boolean;
+  ornament?: string;
+}
+
 export type Block =
   | TextBlock
   | BulletBlock
@@ -140,7 +159,8 @@ export type Block =
   | FootnoteBlock
   | TocBlock
   | GlossaryBlock
-  | PageBreakBlock;
+  | PageBreakBlock
+  | BismillahBlock;
 
 export interface DocMeta {
   title: string;
@@ -211,6 +231,16 @@ export function makeBlock(type: BlockType): Block {
       return { id, type, title: "لغت‌نامه", entries: [], autoDetect: true, twoColumn: true };
     case "pageBreak":
       return { id, type };
+    case "bismillah":
+      return {
+        id,
+        type: "bismillah",
+        text: "به نام یزدان",
+        size: "lg",
+        color: "#0c1a3b",
+        showOrnament: true,
+        ornament: "۞",
+      };
     default:
       return { id, type, text: "" };
   }
@@ -312,6 +342,17 @@ export function convertBlock(block: Block, newType: BlockType): Block {
       };
     case "pageBreak":
       return { id, type: "pageBreak", ...style };
+    case "bismillah":
+      return {
+        id,
+        type: "bismillah",
+        text: text || "به نام یزدان",
+        size: "lg",
+        color: "#0c1a3b",
+        showOrnament: true,
+        ornament: "۞",
+        ...style,
+      };
     default:
       return block;
   }
@@ -482,6 +523,10 @@ export function parseTextToBlocks(text: string): Block[] {
     } else if (/^!\s+/.test(trimmed)) {
       flushAll();
       blocks.push({ id: newId(), type: "callout", text: trimmed.replace(/^!\s+/, "") });
+    } else if (/^(بسم\s*الله|بسمالله|به\s*نام\s*خدا|به\s*نام\s*یزدان|In\s+the\s+name\s+of\s+God|Bismillah)\b/i.test(trimmed)) {
+      // Bismillah-style invocation — render as ornamental centered block
+      flushAll();
+      blocks.push({ id: newId(), type: "bismillah", text: trimmed });
     } else if (/^[-*•·▪►]\s+/.test(trimmed)) {
       flushNumbered();
       flushPara();
@@ -879,6 +924,18 @@ function serializeBlockToTxt(block: Block): string[] {
       lines.push("§E");
       break;
     }
+    case "bismillah": {
+      const bsmAttrs = {
+        ...baseAttrs,
+        size: block.size || "lg",
+        color: block.color || "#0c1a3b",
+        ornament: block.showOrnament === false ? "none" : (block.ornament || "۞"),
+      };
+      lines.push(`§T${fmtAttrs(bsmAttrs)}`);
+      lines.push(escapeTxtLine(block.text || "به نام یزدان"));
+      lines.push("§E");
+      break;
+    }
     case "spacer": {
       lines.push(`§T${fmtAttrs({ ...baseAttrs, height: block.height })}`);
       lines.push("§E");
@@ -1097,6 +1154,24 @@ export function parseTxtToDocument(
       }
       case "pageBreak": {
         blocks.push({ id: baseId, type: "pageBreak", ...style });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "bismillah": {
+        const ornamentAttr = attrs.ornament;
+        // If ornament attr is missing (old files) → default to "۞" shown.
+        // If "none" → no ornament shown.
+        const showOrnament = ornamentAttr !== "none";
+        blocks.push({
+          id: baseId,
+          type: "bismillah",
+          text: bodyLines.join("\n") || "به نام یزدان",
+          size: (attrs.size as BismillahSize) || "lg",
+          color: attrs.color || "#0c1a3b",
+          showOrnament,
+          ornament: ornamentAttr && ornamentAttr !== "none" ? ornamentAttr : "۞",
+          ...style,
+        } as Block);
         if (lines[i]?.startsWith("§E")) i++;
         break;
       }

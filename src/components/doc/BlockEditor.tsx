@@ -39,11 +39,14 @@ import {
   ListTree,
   FileOutput,
   Languages,
+  Sparkles,
 } from "lucide-react";
 import {
   Block,
   BlockType,
   BlockWidth,
+  BismillahBlock,
+  BismillahSize,
   FontSize,
   TextBlock,
   TocEntry,
@@ -334,6 +337,13 @@ function SortableBlock({
       }
       case "pageBreak": {
         return <PageBreakBlockEditor />;
+      }
+      case "bismillah": {
+        return (
+          <div style={blockStyle()}>
+            <BismillahBlockEditor block={block} onPatch={patch} />
+          </div>
+        );
       }
       default:
         return null;
@@ -641,6 +651,7 @@ function BlockTypeOptions() {
     { type: "footnote", label: "پاورقی" },
     { type: "toc", label: "فهرست مطالب" },
     { type: "glossary", label: "لغت‌نامه" },
+    { type: "bismillah", label: "به نام یزدان" },
     { type: "pageBreak", label: "جدید صفحه" },
   ];
   return (
@@ -1896,6 +1907,272 @@ function PageBreakBlockEditor() {
   );
 }
 
+function BismillahBlockEditor({
+  block,
+  onPatch,
+}: {
+  block: BismillahBlock;
+  onPatch: (p: Partial<Block>) => void;
+}) {
+  const size = block.size || "lg";
+  const color = block.color || "#0c1a3b";
+  const showOrnament = block.showOrnament !== false;
+  const ornament = block.ornament || "۞";
+
+  const sizePx: Record<BismillahSize, number> = {
+    sm: 18,
+    md: 22,
+    lg: 28,
+    xl: 36,
+    xxl: 48,
+  };
+  const ornamentPx: Record<BismillahSize, number> = {
+    sm: 12,
+    md: 14,
+    lg: 18,
+    xl: 22,
+    xxl: 28,
+  };
+
+  const sizes: { v: BismillahSize; label: string }[] = [
+    { v: "sm", label: "کوچک" },
+    { v: "md", label: "متوسط" },
+    { v: "lg", label: "بزرگ" },
+    { v: "xl", label: "خیلی بزرگ" },
+    { v: "xxl", label: "غول‌پیکر" },
+  ];
+
+  const ornaments = ["۞", "✦", "❖", "✿", "❁", "✺", "◈"];
+
+  const presetColors = [
+    { v: "#0c1a3b", label: "نیلی" },
+    { v: "#1d4ed8", label: "آبی" },
+    { v: "#6d28d9", label: "بنفش" },
+    { v: "#b45309", label: "طلایی" },
+    { v: "#15803d", label: "سبز" },
+    { v: "#be123c", label: "زرشکی" },
+    { v: "#0f766e", label: "فیروزه‌ای" },
+  ];
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 12,
+        padding: "30px 20px 22px",
+        margin: "10px 0 18px",
+        textAlign: "center",
+        background:
+          "radial-gradient(circle at 50% 30%, rgba(99,102,241,0.08) 0%, transparent 60%), linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(245,243,255,0.94) 100%)",
+        border: "1px solid rgba(99,102,241,0.22)",
+        borderRadius: 14,
+      }}
+    >
+      {/* Live preview area */}
+      {showOrnament && (
+        <div
+          style={{ fontSize: ornamentPx[size], color: "#6366f1", opacity: 0.7, lineHeight: 1 }}
+          aria-hidden
+        >
+          {ornament}
+        </div>
+      )}
+      <input
+        type="text"
+        value={block.text}
+        onChange={(e) => onPatch({ text: e.target.value })}
+        placeholder="به نام یزدان"
+        className="bismillah-text-input"
+        style={{
+          width: "100%",
+          maxWidth: 460,
+          padding: "10px 14px",
+          borderRadius: 10,
+          border: "1px solid rgba(148,163,184,0.32)",
+          background: "#fff",
+          fontFamily: "inherit",
+          fontSize: sizePx[size],
+          fontWeight: 800,
+          color,
+          textAlign: "center",
+          letterSpacing: "1px",
+          outline: "none",
+        }}
+      />
+
+      {/* === Configuration toolbar === */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          marginTop: 4,
+          padding: "8px 10px",
+          borderRadius: 10,
+          background: "rgba(241,245,249,0.65)",
+          border: "1px solid rgba(148,163,184,0.22)",
+          width: "100%",
+          maxWidth: 540,
+          fontSize: 11,
+        }}
+      >
+        {/* Size selector */}
+        <span style={{ color: "#475569", fontWeight: 700, marginLeft: 4 }}>اندازه:</span>
+        <div style={{ display: "flex", gap: 2, flexWrap: "wrap" }}>
+          {sizes.map((s) => (
+            <button
+              key={s.v}
+              type="button"
+              onClick={() => onPatch({ size: s.v })}
+              title={s.label}
+              style={{
+                padding: "3px 8px",
+                borderRadius: 6,
+                border: "1px solid " + (size === s.v ? "rgba(99,102,241,0.5)" : "rgba(148,163,184,0.32)"),
+                background: size === s.v ? "rgba(99,102,241,0.12)" : "#fff",
+                color: size === s.v ? "#4338ca" : "#475569",
+                cursor: "pointer",
+                fontFamily: "inherit",
+                fontSize: 11,
+                fontWeight: 700,
+              }}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Color row: presets + custom */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          padding: "8px 10px",
+          borderRadius: 10,
+          background: "rgba(241,245,249,0.65)",
+          border: "1px solid rgba(148,163,184,0.22)",
+          width: "100%",
+          maxWidth: 540,
+          fontSize: 11,
+        }}
+      >
+        <span style={{ color: "#475569", fontWeight: 700, marginLeft: 4 }}>رنگ متن:</span>
+        {presetColors.map((c) => (
+          <button
+            key={c.v}
+            type="button"
+            onClick={() => onPatch({ color: c.v })}
+            title={c.label}
+            style={{
+              width: 22,
+              height: 22,
+              borderRadius: "50%",
+              border: "2px solid " + (color === c.v ? "#1d4ed8" : "rgba(148,163,184,0.32)"),
+              background: c.v,
+              cursor: "pointer",
+              padding: 0,
+            }}
+          />
+        ))}
+        <label
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 4,
+            fontSize: 11,
+            color: "#475569",
+            fontWeight: 700,
+            cursor: "pointer",
+          }}
+        >
+          دلخواه:
+          <input
+            type="color"
+            value={color}
+            onChange={(e) => onPatch({ color: e.target.value })}
+            style={{ width: 24, height: 24, border: "1px solid rgba(148,163,184,0.32)", borderRadius: 6, padding: 0, cursor: "pointer" }}
+          />
+        </label>
+      </div>
+
+      {/* Ornament toggle + char picker */}
+      <div
+        style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          padding: "8px 10px",
+          borderRadius: 10,
+          background: "rgba(241,245,249,0.65)",
+          border: "1px solid rgba(148,163,184,0.22)",
+          width: "100%",
+          maxWidth: 540,
+          fontSize: 11,
+        }}
+      >
+        <span style={{ color: "#475569", fontWeight: 700, marginLeft: 4 }}>تزئین:</span>
+        <button
+          type="button"
+          onClick={() => onPatch({ showOrnament: !showOrnament })}
+          style={{
+            padding: "3px 10px",
+            borderRadius: 6,
+            border: "1px solid " + (showOrnament ? "rgba(34,197,94,0.4)" : "rgba(148,163,184,0.32)"),
+            background: showOrnament ? "rgba(34,197,94,0.12)" : "#fff",
+            color: showOrnament ? "#15803d" : "#94a3b8",
+            cursor: "pointer",
+            fontFamily: "inherit",
+            fontSize: 11,
+            fontWeight: 700,
+          }}
+        >
+          {showOrnament ? "✓ نمایش داده شود" : "✕ بدون تزئین"}
+        </button>
+        {showOrnament &&
+          ornaments.map((o) => (
+            <button
+              key={o}
+              type="button"
+              onClick={() => onPatch({ ornament: o })}
+              title={`تزئین: ${o}`}
+              style={{
+                width: 26,
+                height: 26,
+                display: "grid",
+                placeItems: "center",
+                borderRadius: 6,
+                border: "1px solid " + (ornament === o ? "rgba(99,102,241,0.5)" : "rgba(148,163,184,0.32)"),
+                background: ornament === o ? "rgba(99,102,241,0.12)" : "#fff",
+                color: ornament === o ? "#4338ca" : "#475569",
+                cursor: "pointer",
+                fontFamily: "inherit",
+                fontSize: 14,
+                padding: 0,
+              }}
+            >
+              {o}
+            </button>
+          ))}
+      </div>
+
+      <div style={{ fontSize: 11, color: "#94a3b8" }}>
+        متن را ویرایش کنید — در خروجی PDF/Word به‌صورت یک خط بزرگ و مرکزی نمایش داده می‌شود
+      </div>
+    </div>
+  );
+}
+
 function BlockTypeMenu({ onPick }: { onPick: (t: BlockType) => void }) {
   const items: { type: BlockType; label: string; icon: React.ReactNode }[] = [
     { type: "title", label: "عنوان اصلی", icon: <Heading1 size={16} /> },
@@ -1915,6 +2192,7 @@ function BlockTypeMenu({ onPick }: { onPick: (t: BlockType) => void }) {
     { type: "footnote", label: "پاورقی", icon: <Bookmark size={16} /> },
     { type: "toc", label: "فهرست مطالب", icon: <ListTree size={16} /> },
     { type: "glossary", label: "لغت‌نامه", icon: <BookOpen size={16} /> },
+    { type: "bismillah", label: "به نام یزدان", icon: <Sparkles size={16} /> },
     { type: "pageBreak", label: "جدید صفحه", icon: <FileOutput size={16} /> },
   ];
   return (

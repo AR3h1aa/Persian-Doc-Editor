@@ -3,6 +3,7 @@
 
 import type {
   Block,
+  BismillahBlock,
   DocMeta,
   FootnoteBlock,
   GlossaryBlock,
@@ -196,6 +197,9 @@ function renderBlock(
     case "pageBreak": {
       return `<div class="doc-pagebreak" aria-hidden="true"></div>`;
     }
+    case "bismillah": {
+      return renderBismillah(b as BismillahBlock);
+    }
     default:
       return "";
   }
@@ -237,6 +241,43 @@ function renderToc(block: TocBlock, entriesHtml: string): string {
     <div class="doc-toc-entries" data-toc-entries="${block.id}">
       ${isEmpty ? '<p class="doc-toc-empty">برای ساخت فهرست، عنوان‌های h2 یا h3 به سند اضافه کنید.</p>' : entriesHtml}
     </div>
+  </div>`;
+}
+
+function renderBismillah(block: BismillahBlock): string {
+  const text = block.text || "به نام یزدان";
+  const size = block.size || "lg";
+  const color = block.color || "#0c1a3b";
+  const showOrnament = block.showOrnament !== false;
+  const ornament = block.ornament || "۞";
+
+  // Map block size → CSS font-size (in px, scaled up slightly for PDF/preview).
+  const sizePx: Record<string, number> = {
+    sm: 18,
+    md: 24,
+    lg: 30,
+    xl: 40,
+    xxl: 56,
+  };
+  const ornamentPx: Record<string, number> = {
+    sm: 12,
+    md: 14,
+    lg: 18,
+    xl: 24,
+    xxl: 32,
+  };
+
+  const fontSize = sizePx[size] ?? sizePx.lg;
+  const ornSize = ornamentPx[size] ?? ornamentPx.lg;
+
+  const ornamentHtml = showOrnament
+    ? `<div class="doc-bismillah-ornament" aria-hidden="true" style="font-size:${ornSize}px">${ornament}</div>`
+    : "";
+
+  return `<div class="doc-bismillah"${blockStyleAttr(block)}>
+    ${ornamentHtml}
+    <p class="doc-bismillah-text" style="font-size:${fontSize}px;color:${color}">${esc(text)}</p>
+    ${ornamentHtml}
   </div>`;
 }
 
@@ -606,7 +647,6 @@ html, body {
   border-radius: 14px;
   padding: 22px 26px;
   margin: 6px 0 14px;
-  break-after: page;
   break-inside: avoid;
 }
 .doc-toc-title {
@@ -728,6 +768,39 @@ html, body {
   padding: 0;
 }
 
+/* Bismillah — centered invocation block, large ornamental text */
+.doc-bismillah {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 36px 24px 30px;
+  margin: 10px 0 18px;
+  text-align: center;
+  background:
+    radial-gradient(circle at 50% 30%, rgba(99,102,241,0.08) 0%, transparent 60%),
+    linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(245,243,255,0.94) 100%);
+  border: 1px solid rgba(99,102,241,0.22);
+  border-radius: 16px;
+  break-inside: avoid;
+}
+.doc-bismillah-text {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 800;
+  line-height: 1.6;
+  color: #0c1a3b;
+  letter-spacing: 1px;
+  font-family: "Vazirmatn", "Segoe UI", sans-serif;
+}
+.doc-bismillah-ornament {
+  font-size: 18px;
+  color: #6366f1;
+  opacity: 0.7;
+  line-height: 1;
+}
+
 .footer {
   margin-top: 22px;
   padding-top: 14px;
@@ -758,9 +831,35 @@ html, body {
 }
 @media print {
   body { background: #fff !important; }
+  /* The .page wrapper has padding for screen view (56px); on print we let
+     the @page margins (14mm / 12mm / 16mm / 12mm) do the work instead.
+     This is what was causing the perceived "full-page gap" between the hero
+     and the first content block — the screen padding stacked with the @page
+     margin and pushed the first block unusually far down. */
   .page { padding: 0 !important; max-width: none !important; }
+  .hero {
+    /* Compact hero on print: smaller padding + tighter bottom margin so
+       the title block (or TOC) sits close underneath it. */
+    padding: 18px 22px !important;
+    margin-bottom: 14px !important;
+    border-radius: 14px !important;
+    box-shadow: none !important;
+  }
+  .hero::before { display: none !important; }
+  .hero-title { font-size: 24px !important; margin: 0 0 4px !important; }
+  .hero-sub { font-size: 13px !important; }
+  .hero-meta-row { margin-bottom: 8px !important; }
+  .content {
+    /* Tighter content padding on print so the first block sits close under the hero. */
+    padding: 16px 18px 18px !important;
+    box-shadow: none !important;
+  }
+  .content > * + * { margin-top: 10px !important; }
   .hero, .content { box-shadow: none !important; }
   .doc-toc, .doc-glossary, .doc-footnotes { box-shadow: none !important; }
+  /* Allow TOC to break across pages instead of jumping to a new page
+     (which left a near-full-page gap when the hero was tall). */
+  .doc-toc { break-inside: auto; }
   /* Ensure each heading doesn't get orphaned at page bottom */
   .doc-h2, .doc-h3 { break-after: avoid; }
 }

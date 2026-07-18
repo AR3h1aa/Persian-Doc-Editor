@@ -52,6 +52,8 @@ import {
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Moon,
+  Sun,
 } from "lucide-react";
 import BlockEditor from "@/components/doc/BlockEditor";
 import {
@@ -118,6 +120,9 @@ export default function Home() {
   const [autosavePulse, setAutosavePulse] = useState<"idle" | "saving" | "done">("idle");
   const [autosaveToastVisible, setAutosaveToastVisible] = useState(false);
   const autosaveToastTimerRef = useRef<number | null>(null);
+  // ===== Dark theme =====
+  // Persisted in localStorage; applies `.dark` class on <html>.
+  const [darkTheme, setDarkTheme] = useState<boolean>(false);
   // Saved snapshots panel + save dialog
   const [snapshots, setSnapshots] = useState<SavedSnapshot[]>([]);
   const [showSnapshots, setShowSnapshots] = useState(false);
@@ -188,6 +193,24 @@ export default function Home() {
       }
     } catch {}
   }, []);
+
+  // ===== Dark theme: load preference + apply to <html> =====
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem("pord-dark-theme");
+      if (stored === "true") setDarkTheme(true);
+    } catch {}
+  }, []);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const root = document.documentElement;
+    if (darkTheme) root.classList.add("dark");
+    else root.classList.remove("dark");
+    try {
+      localStorage.setItem("pord-dark-theme", darkTheme ? "true" : "false");
+    } catch {}
+  }, [darkTheme]);
 
   useEffect(() => {
     const id = setTimeout(() => {
@@ -1382,6 +1405,22 @@ export default function Home() {
             <span>امضای فوتر</span>
           </button>
 
+          {/* Toggle dark theme */}
+          <button
+            type="button"
+            className="tool-pill ghost"
+            onClick={() => setDarkTheme((v) => !v)}
+            title={darkTheme ? "تغییر به تم روشن" : "تغییر به تم تاریک"}
+            style={{
+              background: darkTheme ? "rgba(15,23,42,0.18)" : "transparent",
+              color: darkTheme ? "#a5b4fc" : "#94a3b8",
+              border: "1px solid " + (darkTheme ? "rgba(99,102,241,0.45)" : "rgba(148,163,184,0.32)"),
+            }}
+          >
+            {darkTheme ? <Sun size={14} /> : <Moon size={14} />}
+            <span>{darkTheme ? "تم روشن" : "تم تاریک"}</span>
+          </button>
+
           <button
             type="button"
             className="tool-pill violet"
@@ -2024,6 +2063,7 @@ function BlockTypeMenuSimple({ onPick }: { onPick: (t: BlockType) => void }) {
     { type: "footnote", label: "پاورقی", icon: <Bookmark size={14} /> },
     { type: "toc", label: "فهرست مطالب", icon: <ListTree size={14} /> },
     { type: "glossary", label: "لغت‌نامه", icon: <BookOpen size={14} /> },
+    { type: "bismillah", label: "به نام یزدان", icon: <Sparkles size={14} /> },
     { type: "pageBreak", label: "شکست صفحه A4", icon: <FileOutput size={14} /> },
   ];
   return (
@@ -2314,6 +2354,77 @@ function PreviewBlock({
           ── شکست صفحه A4 ──
         </div>
       );
+    case "bismillah": {
+      const b = block as Extract<Block, { type: "bismillah" }>;
+      const size = b.size || "lg";
+      const color = b.color || "#0c1a3b";
+      const showOrnament = b.showOrnament !== false;
+      const ornament = b.ornament || "۞";
+      const sizePx: Record<string, number> = {
+        sm: 18,
+        md: 24,
+        lg: 30,
+        xl: 40,
+        xxl: 56,
+      };
+      const ornamentPx: Record<string, number> = {
+        sm: 12,
+        md: 14,
+        lg: 18,
+        xl: 24,
+        xxl: 32,
+      };
+      const fontSize = sizePx[size] ?? sizePx.lg;
+      const ornSize = ornamentPx[size] ?? ornamentPx.lg;
+      return (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 14,
+            padding: "36px 24px 30px",
+            margin: "10px 0 18px",
+            textAlign: "center",
+            background:
+              "radial-gradient(circle at 50% 30%, rgba(99,102,241,0.08) 0%, transparent 60%), linear-gradient(180deg, rgba(255,255,255,0.96) 0%, rgba(245,243,255,0.94) 100%)",
+            border: "1px solid rgba(99,102,241,0.22)",
+            borderRadius: 16,
+            breakInside: "avoid",
+          }}
+        >
+          {showOrnament && (
+            <div
+              style={{ fontSize: ornSize, color: "#6366f1", opacity: 0.7, lineHeight: 1 }}
+              aria-hidden
+            >
+              {ornament}
+            </div>
+          )}
+          <p
+            style={{
+              margin: 0,
+              fontSize,
+              fontWeight: 800,
+              lineHeight: 1.6,
+              color,
+              letterSpacing: "1px",
+            }}
+          >
+            {b.text || "به نام یزدان"}
+          </p>
+          {showOrnament && (
+            <div
+              style={{ fontSize: ornSize, color: "#6366f1", opacity: 0.7, lineHeight: 1 }}
+              aria-hidden
+            >
+              {ornament}
+            </div>
+          )}
+        </div>
+      );
+    }
     default:
       return null;
   }
