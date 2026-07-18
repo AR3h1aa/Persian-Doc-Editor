@@ -46,8 +46,11 @@ import {
   BlockWidth,
   FontSize,
   TextBlock,
+  TocEntry,
   convertBlock,
   canMerge,
+  collectTocEntries,
+  headingAnchor,
   newId,
 } from "@/lib/doc-types";
 
@@ -65,6 +68,9 @@ interface BlockEditorProps {
   onCopyBlock: (id: string) => void;
   onAddFootnoteFor: (id: string) => void;
   searchQuery: string;
+  // Whole-document blocks list — currently used by the TOC block editor so it
+  // can compute and display actual detected headings (subtitle/h2/h3).
+  allBlocks?: Block[];
 }
 
 const TEXT_TYPES: BlockType[] = [
@@ -120,6 +126,7 @@ function SortableBlock({
   canUp,
   canDown,
   canMergeNext,
+  allBlocks,
 }: {
   block: Block;
   onChange: (b: Block) => void;
@@ -137,6 +144,7 @@ function SortableBlock({
   canUp: boolean;
   canDown: boolean;
   canMergeNext: boolean;
+  allBlocks?: Block[];
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: block.id });
@@ -221,9 +229,18 @@ function SortableBlock({
             : block.type === "callout"
             ? "متن فراخوانی (callout)…"
             : "متن پاراگراف…";
+        // Attach a stable anchor id for headings so the TOC links can scroll to them.
+        const anchorId =
+          block.type === "title" ||
+          block.type === "subtitle" ||
+          block.type === "h2" ||
+          block.type === "h3"
+            ? headingAnchor(block.id)
+            : undefined;
         return (
           <div style={blockStyle()}>
             <div
+              id={anchorId}
               className={cls}
               contentEditable
               suppressContentEditableWarning
@@ -300,7 +317,11 @@ function SortableBlock({
       case "toc": {
         return (
           <div style={blockStyle()}>
-            <TocBlockEditor block={block} onPatch={patch} />
+            <TocBlockEditor
+              block={block}
+              onPatch={patch}
+              allBlocks={allBlocks ?? [block]}
+            />
           </div>
         );
       }
@@ -1354,19 +1375,33 @@ function FootnoteBlockEditor({
   );
 }
 
-// TOC block editor — title + level toggles + live preview of entries
+// TOC block editor — title + level toggles + live preview of detected entries
 function TocBlockEditor({
   block,
   onPatch,
+  allBlocks,
 }: {
   block: Extract<Block, { type: "toc" }>;
   onPatch: (p: Partial<Block>) => void;
+  allBlocks?: Block[];
 }) {
+  // Compute the actual TOC entries from the document's headings.
+  const entries: TocEntry[] = (allBlocks ?? [])
+    ? collectTocEntries(allBlocks!, {
+        includeH2: block.includeH2,
+        includeH3: block.includeH3,
+        includeSubtitle: block.includeSubtitle,
+      })
+    : [];
+
+  const activeLevels = [
+    block.includeSubtitle && "زیرعنوان",
+    block.includeH2 && "تیتر بخش",
+    block.includeH3 && "تیتر فرعی",
+  ].filter(Boolean);
+
   return (
-    <div
-      className="doc-toc"
-      style={{ breakAfter: "auto" }}
-    >
+    <div className="doc-toc" style={{ breakAfter: "auto" }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
         <ListTree size={18} style={{ color: "#1d4ed8" }} />
         <input
@@ -1431,20 +1466,176 @@ function TocBlockEditor({
         })}
       </div>
 
+      {/* ===== Live preview of detected entries ===== */}
       <div
         style={{
-          padding: "10px 12px",
-          borderRadius: 8,
-          background: "rgba(255,255,255,0.6)",
-          border: "1px dashed rgba(99,102,241,0.32)",
-          fontSize: 12,
-          color: "#475569",
-          lineHeight: 1.7,
+          padding: "10px 12px 12px",
+          borderRadius: 10,
+          background: "rgba(255,255,255,0.78)",
+          border: "1px solid rgba(99,102,241,0.18)",
+          boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.4)",
         }}
       >
-        <strong style={{ color: "#1d4ed8" }}>پیش‌نمایش:</strong> فهرست مطالب به‌صورت خودکار از
-        تیترهای سند ساخته می‌شود. شماره صفحه‌ها به‌طور خودکار هنگام خروجی PDF محاسبه و درج
-        می‌شوند. این بلوک در زمان چاپ، یک صفحه کامل را اشغال می‌کند.
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 8,
+            marginBottom: 8,
+            fontSize: 11.5,
+            color: "#475569",
+          }}
+        >
+          <span style={{ fontWeight: 700, color: "#1d4ed8" }}>
+            <ListTree size={12} style={{ marginLeft: 4, verticalAlign: "-2px" }} />
+            پیش‌نمایش فهرست
+          </span>
+          <span style={{ fontWeight: 600 }}>
+            {entries.length === 0
+              ? "هیچ عنوانی شناسایی نشد"
+              : `${entries.length.toLocaleString("fa-IR")} عنوان • سطوح: ${activeLevels.join("، ") || "—"}`}
+          </span>
+        </div>
+
+        {entries.length === 0 ? (
+          <div
+            style={{
+              padding: "14px 10px",
+              borderRadius: 8,
+              background: "rgba(245,158,11,0.06)",
+              border: "1px dashed rgba(245,158,11,0.32)",
+              color: "#92400e",
+              fontSize: 12.5,
+              lineHeight: 1.7,
+              textAlign: "center",
+            }}
+          >
+            برای ساخت فهرست، عنوان‌های <strong>h2</strong> یا <strong>h3</strong> به
+            سند اضافه کنید. در صورت فعال بودن سطوح بالا، عنوان‌های یافت‌شده به‌صورت
+            خودکار اینجا فهرست می‌شوند.
+          </div>
+        ) : (
+          <ol
+            style={{
+              listStyle: "none",
+              padding: 0,
+              margin: 0,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            {entries.map((e, idx) => {
+              const anchor = headingAnchor(e.id);
+              const indent = e.level === 1 ? 0 : e.level === 2 ? 18 : 36;
+              const isLvl1 = e.level === 1;
+              const isLvl2 = e.level === 2;
+              const isLvl3 = e.level === 3;
+              return (
+                <li
+                  key={e.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "5px 8px",
+                    borderRadius: 6,
+                    background: isLvl1
+                      ? "rgba(29,78,216,0.06)"
+                      : isLvl2
+                      ? "rgba(99,102,241,0.04)"
+                      : "transparent",
+                    borderInlineStart: isLvl1
+                      ? "3px solid #1d4ed8"
+                      : isLvl2
+                      ? "3px solid #6366f1"
+                      : "3px solid transparent",
+                    color: isLvl1
+                      ? "#0c1a3b"
+                      : isLvl2
+                      ? "#1d4ed8"
+                      : "#475569",
+                    fontWeight: isLvl1 ? 700 : isLvl2 ? 600 : 400,
+                    fontSize: isLvl1 ? 14 : isLvl2 ? 13 : 12.5,
+                    paddingInlineStart: indent + 8,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontFamily: "inherit",
+                      fontVariantNumeric: "tabular-nums",
+                      opacity: 0.6,
+                      minWidth: 18,
+                    }}
+                  >
+                    {(idx + 1).toLocaleString("fa-IR")}.
+                  </span>
+                  <a
+                    href={`#${anchor}`}
+                    onClick={(ev) => {
+                      ev.preventDefault();
+                      const target = document.getElementById(anchor);
+                      if (target) {
+                        target.scrollIntoView({
+                          behavior: "smooth",
+                          block: "center",
+                        });
+                        // Brief highlight
+                        target.style.transition = "background 220ms ease";
+                        const prevBg = target.style.background;
+                        target.style.background = "rgba(245,158,11,0.18)";
+                        window.setTimeout(() => {
+                          target.style.background = prevBg;
+                        }, 1400);
+                      }
+                    }}
+                    style={{
+                      flex: 1,
+                      color: "inherit",
+                      textDecoration: "none",
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      cursor: "pointer",
+                    }}
+                    title={e.text || "(بدون عنوان)"}
+                  >
+                    {e.text || "(بدون عنوان)"}
+                  </a>
+                  <span
+                    style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      color: isLvl1 ? "#1d4ed8" : isLvl2 ? "#6366f1" : "#94a3b8",
+                      padding: "2px 6px",
+                      borderRadius: 999,
+                      background: "rgba(255,255,255,0.6)",
+                      border: "1px solid rgba(148,163,184,0.24)",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {isLvl1 ? "زیرعنوان" : isLvl2 ? "h2" : "h3"}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+
+        <div
+          style={{
+            marginTop: 10,
+            paddingTop: 8,
+            borderTop: "1px dashed rgba(148,163,184,0.32)",
+            fontSize: 11,
+            color: "#64748b",
+            lineHeight: 1.6,
+          }}
+        >
+          شماره صفحه‌ها به‌طور خودکار هنگام خروجی PDF/Word محاسبه و درج می‌شوند.
+          با کلیک روی هر مورد، به بلوک متناظر در سند اسکرول می‌شود.
+        </div>
       </div>
     </div>
   );
@@ -1758,8 +1949,12 @@ export default function BlockEditor({
   onCopyBlock,
   onAddFootnoteFor,
   searchQuery,
+  allBlocks,
 }: BlockEditorProps) {
   const { setNodeRef } = useDroppable({ id: "blocks-canvas" });
+  // If the caller didn't pass an explicit allBlocks list, fall back to `blocks`
+  // so the TOC editor still sees the whole document.
+  const docBlocks = allBlocks ?? blocks;
 
   return (
     <div ref={setNodeRef} style={{ position: "relative", paddingInlineStart: 12 }}>
@@ -1788,6 +1983,7 @@ export default function BlockEditor({
               onCopyBlock={() => onCopyBlock(b.id)}
               onAddFootnoteFor={() => onAddFootnoteFor(b.id)}
               searchQuery={searchQuery}
+              allBlocks={docBlocks}
             />
           );
         })}

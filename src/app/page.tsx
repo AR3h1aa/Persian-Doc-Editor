@@ -22,6 +22,9 @@ import {
   Pencil,
   Sparkles,
   Upload,
+  Download,
+  FolderOpen,
+  Trash2,
   Table as TableIcon,
   Code2,
   Square,
@@ -44,6 +47,9 @@ import {
   FileOutput,
   Languages,
   X,
+  Edit3,
+  RefreshCw,
+  CheckCircle2,
 } from "lucide-react";
 import BlockEditor from "@/components/doc/BlockEditor";
 import {
@@ -52,16 +58,27 @@ import {
   DocMeta,
   GlossaryBlock,
   ImageBlock,
+  SavedSnapshot,
   TextBlock,
+  TocEntry,
   convertBlock,
   countWordsAndChars,
+  collectTocEntries,
+  deleteSnapshot,
   detectEnglishWords,
+  formatSnapshotTime,
+  headingAnchor,
+  loadSnapshots,
   makeBlock,
   mergeBlocks,
   newId,
   parseHtmlToBlocks,
   parseTextToBlocks,
+  parseTxtToDocument,
+  renameSnapshot,
+  saveSnapshot,
   seedDocument,
+  serializeDocumentToTxt,
   syncGlossaryEntries,
 } from "@/lib/doc-types";
 import { exportToPdf, exportToWord } from "@/lib/export-doc";
@@ -90,10 +107,21 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [pasteHint, setPasteHint] = useState<string | null>(null);
+  // Periodic autosave (every 60s) — shows a top-left toast with a spin animation
+  const [autosavePulse, setAutosavePulse] = useState<"idle" | "saving" | "done">("idle");
+  const [autosaveToastVisible, setAutosaveToastVisible] = useState(false);
+  const autosaveToastTimerRef = useRef<number | null>(null);
+  // Saved snapshots panel + save dialog
+  const [snapshots, setSnapshots] = useState<SavedSnapshot[]>([]);
+  const [showSnapshots, setShowSnapshots] = useState(false);
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [snapshotName, setSnapshotName] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const txtInputRef = useRef<HTMLInputElement>(null);
   const pendingImageIdRef = useRef<string | null>(null);
   const addMenuRef = useRef<HTMLDivElement>(null);
+  const snapshotsPanelRef = useRef<HTMLDivElement>(null);
+  const saveDialogRef = useRef<HTMLDivElement>(null);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -124,6 +152,51 @@ export default function Home() {
     return () => clearTimeout(id);
   }, [meta, blocks]);
 
+  // ===== Periodic autosave (every 60 seconds) =====
+  // Keeps a live ref to the latest state so the interval callback always sees
+  // up-to-date data without re-subscribing on every keystroke.
+  const latestStateRef = useRef({ meta, blocks });
+  useEffect(() => {
+    latestStateRef.current = { meta, blocks };
+  }, [meta, blocks]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      // Show "saving" state with spin animation
+      setAutosavePulse("saving");
+      setAutosaveToastVisible(true);
+
+      // Save to localStorage (same key as the debounced autosave)
+      try {
+        const { meta: m, blocks: bs } = latestStateRef.current;
+        localStorage.setItem("doc-editor-state", JSON.stringify({ meta: m, blocks: bs }));
+        const now = new Date().toLocaleTimeString("fa-IR");
+        setSavedAt(now);
+      } catch {}
+
+      // After ~700ms, switch to "done" state with check icon
+      window.setTimeout(() => {
+        setAutosavePulse("done");
+      }, 700);
+
+      // After 3.2s total, hide the toast
+      if (autosaveToastTimerRef.current) {
+        window.clearTimeout(autosaveToastTimerRef.current);
+      }
+      autosaveToastTimerRef.current = window.setTimeout(() => {
+        setAutosaveToastVisible(false);
+        setAutosavePulse("idle");
+      }, 3200);
+    }, 60_000); // 1 minute — production interval
+
+    return () => {
+      window.clearInterval(id);
+      if (autosaveToastTimerRef.current) {
+        window.clearTimeout(autosaveToastTimerRef.current);
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (!showAddMenu) return;
     const handler = (e: MouseEvent) => {
@@ -146,6 +219,33 @@ export default function Home() {
     const t = setTimeout(() => setPasteHint(null), 4000);
     return () => clearTimeout(t);
   }, [pasteHint]);
+
+  // Load saved snapshots from localStorage on mount
+  useEffect(() => {
+    setSnapshots(loadSnapshots());
+  }, []);
+
+  // Click-outside handler for the snapshots panel and save dialog
+  useEffect(() => {
+    if (!showSnapshots && !showSaveDialog) return;
+    const handler = (e: MouseEvent) => {
+      if (
+        snapshotsPanelRef.current &&
+        !snapshotsPanelRef.current.contains(e.target as Node) &&
+        saveDialogRef.current &&
+        !saveDialogRef.current.contains(e.target as Node)
+      ) {
+        // Only close the panel; the save dialog has its own buttons
+        const target = e.target as HTMLElement;
+        // Don't close if the click was on the "saved" or "save" toolbar button
+        if (!target.closest("[data-snapshot-toggle]")) {
+          setShowSnapshots(false);
+        }
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showSnapshots, showSaveDialog]);
 
   // ===== Auto-detect English words and sync glossary blocks =====
   useEffect(() => {
@@ -359,33 +459,9 @@ export default function Home() {
     txtInputRef.current?.click();
   }
 
-  function handleTxtChosen(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      const text = reader.result as string;
-      const parsed = parseTextToBlocks(text);
-      if (parsed.length === 0) {
-        showToast("فایل خالی است");
-        return;
-      }
-      const replace = confirm(
-        `${parsed.length} بلوک از فایل خوانده شد.\nOK = جایگزینی کل سند\nCancel = افزودن به انتهای سند فعلی`
-      );
-      if (replace) {
-        setBlocks(parsed);
-        if (parsed[0] && "text" in parsed[0]) {
-          setMeta((m) => ({ ...m, title: (parsed[0] as TextBlock).text || m.title }));
-        }
-      } else {
-        setBlocks((prev) => [...prev, ...parsed]);
-      }
-      showToast(`${parsed.length} بلوک ایمپورت شد ✓`);
-    };
-    reader.readAsText(file);
-  }
+  // handleTxtChosen is defined further down (after snapshot handlers) so it
+  // can use the native-format parser. The version near openTxtPicker has been
+  // removed to avoid duplication.
 
   // ===== Copy block to clipboard (with custom MIME) =====
   async function copyBlockToClipboard(id: string) {
@@ -614,6 +690,115 @@ export default function Home() {
     ]);
   }
 
+  // ===== Saved snapshots =====
+  function openSaveDialog() {
+    setSnapshotName(meta.title || "سند " + new Date().toLocaleDateString("fa-IR"));
+    setShowSaveDialog(true);
+    setShowSnapshots(false);
+  }
+
+  function confirmSaveSnapshot() {
+    const name = snapshotName.trim() || "بدون نام";
+    saveSnapshot(name, meta, blocks);
+    setSnapshots(loadSnapshots());
+    setShowSaveDialog(false);
+    showToast(`«${name}» ذخیره شد ✓`);
+  }
+
+  function loadSnapshotById(id: string) {
+    const snap = snapshots.find((s) => s.id === id);
+    if (!snap) return;
+    setMeta({ ...snap.meta });
+    // Deep clone so editing doesn't mutate the saved snapshot
+    setBlocks(JSON.parse(JSON.stringify(snap.blocks)) as Block[]);
+    setShowSnapshots(false);
+    showToast(`«${snap.name}» بارگذاری شد ✓`);
+    setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 50);
+  }
+
+  function removeSnapshot(id: string) {
+    const snap = snapshots.find((s) => s.id === id);
+    if (!snap) return;
+    if (!confirm(`سند ذخیره‌شده «${snap.name}» حذف شود؟`)) return;
+    deleteSnapshot(id);
+    setSnapshots(loadSnapshots());
+    showToast("سند ذخیره‌شده حذف شد");
+  }
+
+  function renameSnapshotById(id: string) {
+    const snap = snapshots.find((s) => s.id === id);
+    if (!snap) return;
+    const newName = prompt("نام جدید را وارد کنید:", snap.name);
+    if (newName === null || newName.trim() === "") return;
+    renameSnapshot(id, newName.trim());
+    setSnapshots(loadSnapshots());
+    showToast("نام تغییر کرد ✓");
+  }
+
+  // ===== Export TXT (round-trip native format) =====
+  function handleExportTxt() {
+    const txt = serializeDocumentToTxt(meta, blocks);
+    const safeTitle = (meta.title || "document")
+      .replace(/[\\/:*?\"<>|]/g, "_")
+      .replace(/\s+/g, "_")
+      .slice(0, 60);
+    const blob = new Blob([txt], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${safeTitle || "document"}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    showToast("خروجی TXT ساخته شد — با ایمپورت txt قابل بازیابی است ✓");
+  }
+
+  // ===== Updated TXT import — detects native format and restores blocks =====
+  function handleTxtChosen(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result as string;
+      const result = parseTxtToDocument(text);
+      if (result.blocks.length === 0) {
+        showToast("فایل خالی است");
+        return;
+      }
+      if (result.isNative) {
+        // Native format — full round-trip restore (meta + typed blocks)
+        const replace = confirm(
+          `${result.blocks.length} بلوک از فایل خوانده شد (فرمت بومی).\nOK = جایگزینی کل سند\nCancel = افزودن به انتهای سند فعلی`
+        );
+        if (replace) {
+          if (result.meta) setMeta(result.meta);
+          setBlocks(result.blocks);
+        } else {
+          setBlocks((prev) => [...prev, ...result.blocks]);
+        }
+        showToast(`${result.blocks.length} بلوک از فایل بازیابی شد ✓`);
+      } else {
+        // Legacy plain-text file — parse with markdown heuristics
+        const parsed = result.blocks;
+        const replace = confirm(
+          `${parsed.length} بلوک از فایل خوانده شد (متن خام).\nOK = جایگزینی کل سند\nCancel = افزودن به انتهای سند فعلی`
+        );
+        if (replace) {
+          setBlocks(parsed);
+          if (parsed[0] && "text" in parsed[0]) {
+            setMeta((m) => ({ ...m, title: (parsed[0] as TextBlock).text || m.title }));
+          }
+        } else {
+          setBlocks((prev) => [...prev, ...parsed]);
+        }
+        showToast(`${parsed.length} بلوک ایمپورت شد ✓`);
+      }
+    };
+    reader.readAsText(file);
+  }
+
   // Scroll to a block by index when user clicks a search result
   function scrollToBlock(idx: number) {
     const el = document.querySelector(`[data-block-idx="${idx}"]`);
@@ -837,11 +1022,273 @@ export default function Home() {
             type="button"
             className="tool-pill ghost"
             onClick={openTxtPicker}
-            title="ایمپورت از فایل متنی"
+            title="ایمپورت از فایل متنی (.txt) — هم متن خام و هم فرمت بومی ویرایشگر را تشخیص می‌دهد"
           >
             <Upload size={14} />
             <span>ایمپورت txt</span>
           </button>
+
+          <button
+            type="button"
+            className="tool-pill ghost"
+            onClick={handleExportTxt}
+            title="خروجی TXT با حفظ نوع بلوک‌ها — با ایمپورت دوباره، سند دقیقاً همین‌طور برمی‌گردد"
+          >
+            <Download size={14} />
+            <span>خروجی txt</span>
+          </button>
+
+          <button
+            type="button"
+            className="tool-pill ghost"
+            onClick={openSaveDialog}
+            data-snapshot-toggle="save"
+            title="ذخیره‌ی نسخه‌ی فعلی سند برای ویرایش بعدی"
+          >
+            <Save size={14} />
+            <span>ذخیره</span>
+          </button>
+
+          <div style={{ position: "relative" }}>
+            <button
+              type="button"
+              className="tool-pill ghost"
+              onClick={() => {
+                setShowSnapshots((v) => !v);
+                setSnapshots(loadSnapshots());
+              }}
+              data-snapshot-toggle="open"
+              title="سندهای ذخیره‌شده قبلی"
+              style={{ position: "relative" }}
+            >
+              <FolderOpen size={14} />
+              <span>سندهای من</span>
+              {snapshots.length > 0 && (
+                <span
+                  style={{
+                    position: "absolute",
+                    top: -4,
+                    insetInlineEnd: -4,
+                    background: "#6366f1",
+                    color: "#fff",
+                    borderRadius: 999,
+                    minWidth: 16,
+                    height: 16,
+                    padding: "0 4px",
+                    fontSize: 10,
+                    fontWeight: 700,
+                    display: "grid",
+                    placeItems: "center",
+                  }}
+                >
+                  {snapshots.length}
+                </span>
+              )}
+            </button>
+            {showSnapshots && (
+              <div
+                ref={snapshotsPanelRef}
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 6px)",
+                  insetInlineStart: 0,
+                  width: 380,
+                  maxHeight: 480,
+                  overflowY: "auto",
+                  background: "#fff",
+                  border: "1px solid rgba(148,163,184,0.32)",
+                  borderRadius: 12,
+                  boxShadow: "0 16px 36px rgba(15,23,42,0.22)",
+                  padding: 8,
+                  zIndex: 60,
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    padding: "4px 8px 8px",
+                    borderBottom: "1px solid rgba(148,163,184,0.18)",
+                    marginBottom: 6,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: "#0c1a3b",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 6,
+                    }}
+                  >
+                    <FolderOpen size={14} style={{ color: "#4338ca" }} />
+                    سندهای ذخیره‌شده
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setShowSnapshots(false)}
+                    style={{
+                      width: 22,
+                      height: 22,
+                      display: "grid",
+                      placeItems: "center",
+                      borderRadius: 5,
+                      border: "none",
+                      background: "transparent",
+                      color: "#64748b",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <X size={14} />
+                  </button>
+                </div>
+                {snapshots.length === 0 ? (
+                  <div
+                    style={{
+                      padding: "16px 12px",
+                      textAlign: "center",
+                      color: "#64748b",
+                      fontSize: 12.5,
+                      lineHeight: 1.7,
+                    }}
+                  >
+                    هنوز سندی ذخیره نشده است.
+                    <br />
+                    روی دکمه‌ی «ذخیره» بزنید تا نسخه‌ی فعلی سند برای ویرایش بعدی ذخیره شود.
+                  </div>
+                ) : (
+                  snapshots.map((snap) => (
+                    <div
+                      key={snap.id}
+                      style={{
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        border: "1px solid rgba(148,163,184,0.16)",
+                        background: "rgba(238,242,255,0.4)",
+                        marginBottom: 4,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 4,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 13,
+                            fontWeight: 700,
+                            color: "#0c1a3b",
+                            flex: 1,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={snap.name}
+                        >
+                          {snap.name}
+                        </span>
+                        <div style={{ display: "flex", gap: 4 }}>
+                          <button
+                            type="button"
+                            onClick={() => renameSnapshotById(snap.id)}
+                            title="تغییر نام"
+                            style={{
+                              width: 22,
+                              height: 22,
+                              display: "grid",
+                              placeItems: "center",
+                              borderRadius: 5,
+                              border: "1px solid rgba(148,163,184,0.32)",
+                              background: "#fff",
+                              color: "#475569",
+                              cursor: "pointer",
+                            }}
+                          >
+                            <Edit3 size={11} />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeSnapshot(snap.id)}
+                            title="حذف"
+                            style={{
+                              width: 22,
+                              height: 22,
+                              display: "grid",
+                              placeItems: "center",
+                              borderRadius: 5,
+                              border: "1px solid rgba(220,38,38,0.3)",
+                              background: "#fff",
+                              color: "#dc2626",
+                              cursor: "pointer",
+                            }}
+                          >
+                            <Trash2 size={11} />
+                          </button>
+                        </div>
+                      </div>
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "space-between",
+                          gap: 6,
+                          fontSize: 11,
+                          color: "#64748b",
+                        }}
+                      >
+                        <span>{formatSnapshotTime(snap.savedAt)}</span>
+                        <span>
+                          {snap.blocks.length} بلوک
+                          {snap.meta.author ? " • " + snap.meta.author : ""}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => loadSnapshotById(snap.id)}
+                        style={{
+                          marginTop: 2,
+                          padding: "5px 10px",
+                          borderRadius: 6,
+                          border: "1px solid #2563eb",
+                          background: "linear-gradient(135deg, #2563eb, #4338ca)",
+                          color: "#fff",
+                          fontFamily: "inherit",
+                          fontSize: 12,
+                          fontWeight: 700,
+                          cursor: "pointer",
+                        }}
+                      >
+                        بارگذاری این سند
+                      </button>
+                    </div>
+                  ))
+                )}
+                {snapshots.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: 6,
+                      padding: "6px 8px",
+                      fontSize: 11,
+                      color: "#64748b",
+                      textAlign: "center",
+                      borderTop: "1px solid rgba(148,163,184,0.18)",
+                    }}
+                  >
+                    سندها فقط روی همین مرورگر ذخیره می‌شوند. برای انتقال به دستگاه دیگر،
+                    از «خروجی txt» استفاده کنید.
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
 
           <button
             type="button"
@@ -1079,6 +1526,7 @@ export default function Home() {
                     onCopyBlock={copyBlockToClipboard}
                     onAddFootnoteFor={addFootnoteFor}
                     searchQuery={searchQuery}
+                    allBlocks={blocks}
                   />
                 </DndContext>
               )}
@@ -1122,6 +1570,164 @@ export default function Home() {
         صفحه‌بندی A4
       </footer>
 
+      {/* ===== Save snapshot dialog ===== */}
+      {showSaveDialog && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(15,23,42,0.5)",
+            backdropFilter: "blur(4px)",
+            display: "grid",
+            placeItems: "center",
+            zIndex: 100,
+            padding: 16,
+          }}
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setShowSaveDialog(false);
+          }}
+        >
+          <div
+            ref={saveDialogRef}
+            style={{
+              width: "min(440px, 94vw)",
+              background: "#fff",
+              borderRadius: 16,
+              border: "1px solid rgba(148,163,184,0.32)",
+              boxShadow: "0 24px 56px rgba(15,23,42,0.32)",
+              padding: 22,
+              fontFamily: "inherit",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                marginBottom: 12,
+              }}
+            >
+              <div
+                style={{
+                  width: 40,
+                  height: 40,
+                  borderRadius: 10,
+                  display: "grid",
+                  placeItems: "center",
+                  background: "linear-gradient(135deg, #6366f1, #2563eb)",
+                  color: "#fff",
+                }}
+              >
+                <Save size={18} />
+              </div>
+              <div>
+                <div style={{ fontSize: 17, fontWeight: 800, color: "#0c1a3b" }}>
+                  ذخیره‌ی سند
+                </div>
+                <div style={{ fontSize: 12, color: "#64748b", marginTop: 2 }}>
+                  سند با تمام بلوک‌ها و تنظیمات در مرورگر شما ذخیره می‌شود
+                </div>
+              </div>
+            </div>
+            <label
+              style={{
+                display: "block",
+                fontSize: 12,
+                fontWeight: 600,
+                color: "#475569",
+                marginBottom: 6,
+              }}
+            >
+              نام سند
+            </label>
+            <input
+              type="text"
+              value={snapshotName}
+              onChange={(e) => setSnapshotName(e.target.value)}
+              autoFocus
+              placeholder="مثلاً: گزارش فروش تابستان"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") confirmSaveSnapshot();
+                if (e.key === "Escape") setShowSaveDialog(false);
+              }}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(148,163,184,0.32)",
+                background: "#fff",
+                fontFamily: "inherit",
+                fontSize: 14,
+                color: "#0c1a3b",
+                textAlign: "right",
+              }}
+            />
+            <div
+              style={{
+                marginTop: 10,
+                padding: "8px 10px",
+                background: "rgba(238,242,255,0.7)",
+                border: "1px dashed rgba(99,102,241,0.3)",
+                borderRadius: 8,
+                fontSize: 11.5,
+                color: "#475569",
+                lineHeight: 1.7,
+              }}
+            >
+              <strong style={{ color: "#4338ca" }}>اطلاعات سند:</strong>{" "}
+              {blocks.length} بلوک • عنوان: «{meta.title || "بدون عنوان"}»
+              {meta.author ? " • نویسنده: " + meta.author : ""}
+              <br />
+              برای انتقال بین دستگاه‌ها از «خروجی txt» استفاده کنید.
+            </div>
+            <div
+              style={{
+                display: "flex",
+                gap: 8,
+                marginTop: 16,
+                justifyContent: "flex-end",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setShowSaveDialog(false)}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: 8,
+                  border: "1px solid rgba(148,163,184,0.32)",
+                  background: "#fff",
+                  color: "#475569",
+                  fontFamily: "inherit",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                لغو
+              </button>
+              <button
+                type="button"
+                onClick={confirmSaveSnapshot}
+                style={{
+                  padding: "8px 18px",
+                  borderRadius: 8,
+                  border: "none",
+                  background: "linear-gradient(135deg, #2563eb, #4338ca)",
+                  color: "#fff",
+                  fontFamily: "inherit",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                  boxShadow: "0 4px 12px rgba(99,102,241,0.32)",
+                }}
+              >
+                ذخیره کن
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ===== Toast ===== */}
       {toast && (
         <div
@@ -1144,6 +1750,35 @@ export default function Home() {
           {toast}
         </div>
       )}
+
+      {/* ===== Periodic autosave toast (top-left, with animation) ===== */}
+      <div
+        className={`autosave-toast ${autosaveToastVisible ? "is-visible" : ""}`}
+        aria-live="polite"
+        dir="rtl"
+      >
+        <div className="autosave-toast-inner">
+          <span className="autosave-toast-icon" aria-hidden>
+            {autosavePulse === "saving" ? (
+              <RefreshCw size={15} className="autosave-spin" />
+            ) : autosavePulse === "done" ? (
+              <CheckCircle2 size={15} />
+            ) : (
+              <Save size={15} />
+            )}
+          </span>
+          <span className="autosave-toast-text">
+            {autosavePulse === "saving"
+              ? "در حال ذخیره خودکار…"
+              : autosavePulse === "done"
+              ? `ذخیره خودکار شد • ${savedAt ?? ""}`
+              : "ذخیره خودکار فعال"}
+          </span>
+          <span className="autosave-toast-progress" aria-hidden>
+            <span className="autosave-toast-progress-bar" />
+          </span>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1258,7 +1893,12 @@ function PreviewPane({ meta, blocks }: { meta: DocMeta; blocks: Block[] }) {
             <div className="empty-hint">سند خالی است.</div>
           ) : (
             blocks.map((b) => (
-              <PreviewBlock key={b.id} block={b} fnNumberMap={fnNumberMap} />
+              <PreviewBlock
+                key={b.id}
+                block={b}
+                fnNumberMap={fnNumberMap}
+                allBlocks={blocks}
+              />
             ))
           )}
         </div>
@@ -1285,9 +1925,11 @@ function PreviewPane({ meta, blocks }: { meta: DocMeta; blocks: Block[] }) {
 function PreviewBlock({
   block,
   fnNumberMap,
+  allBlocks,
 }: {
   block: Block;
   fnNumberMap: Map<string, number>;
+  allBlocks?: Block[];
 }) {
   const style: React.CSSProperties = {};
   if (block.fontSize) style.fontSize = `${FONT_SIZE_PX[block.fontSize]}px`;
@@ -1317,15 +1959,24 @@ function PreviewBlock({
     });
   }
 
+  // Stable anchor id for headings (so the TOC links can scroll to them in preview too)
+  const headingId =
+    block.type === "title" ||
+    block.type === "subtitle" ||
+    block.type === "h2" ||
+    block.type === "h3"
+      ? headingAnchor(block.id)
+      : undefined;
+
   switch (block.type) {
     case "title":
-      return <h1 className="doc-title" style={style}>{block.text}</h1>;
+      return <h1 id={headingId} className="doc-title" style={style}>{block.text}</h1>;
     case "subtitle":
-      return <h2 className="doc-subtitle" style={style}>{block.text}</h2>;
+      return <h2 id={headingId} className="doc-subtitle" style={style}>{block.text}</h2>;
     case "h2":
-      return <h2 className="doc-h2" style={style}>{block.text}</h2>;
+      return <h2 id={headingId} className="doc-h2" style={style}>{block.text}</h2>;
     case "h3":
-      return <h3 className="doc-h3" style={style}>{block.text}</h3>;
+      return <h3 id={headingId} className="doc-h3" style={style}>{block.text}</h3>;
     case "paragraph":
       return <p className="doc-paragraph" style={style}>{renderText(block.text)}</p>;
     case "bullet":
@@ -1437,7 +2088,7 @@ function PreviewBlock({
       // Footnotes are rendered in the footer section of PreviewPane, not inline.
       return null;
     case "toc":
-      return <PreviewToc block={block} blocks={null} />;
+      return <PreviewToc block={block} allBlocks={allBlocks ?? [block]} />;
     case "glossary":
       return <PreviewGlossary block={block} />;
     case "pageBreak":
@@ -1467,27 +2118,120 @@ function PreviewBlock({
 
 function PreviewToc({
   block,
+  allBlocks,
 }: {
   block: Extract<Block, { type: "toc" }>;
-  blocks: Block[] | null;
+  allBlocks: Block[];
 }) {
-  // Note: in this live preview we can't access the full blocks list from here.
-  // We rely on the parent to pass entries; but for simplicity we render the
-  // TOC shell and a hint that page numbers are computed at export time.
+  const entries: TocEntry[] = collectTocEntries(allBlocks, {
+    includeH2: block.includeH2,
+    includeH3: block.includeH3,
+    includeSubtitle: block.includeSubtitle,
+  });
+
+  const activeLevels = [
+    block.includeSubtitle && "زیرعنوان",
+    block.includeH2 && "تیتر بخش",
+    block.includeH3 && "تیتر فرعی",
+  ].filter(Boolean);
+
   return (
     <div className="doc-toc">
       <h2 className="doc-toc-title">{block.title || "فهرست مطالب"}</h2>
-      <div style={{ fontSize: 12.5, color: "#64748b", fontStyle: "italic", lineHeight: 1.7 }}>
-        فهرست مطالب به‌صورت خودکار از تیترهای سند ساخته می‌شود. شماره صفحه‌ها در خروجی
-        PDF به‌طور خودکار محاسبه و درج می‌شوند. سطوح فعال:{" "}
-        {[
-          block.includeSubtitle && "زیرعنوان",
-          block.includeH2 && "تیتر بخش",
-          block.includeH3 && "تیتر فرعی",
-        ]
-          .filter(Boolean)
-          .join("، ")}
-      </div>
+      {entries.length === 0 ? (
+        <div style={{ fontSize: 13, color: "#64748b", lineHeight: 1.7 }}>
+          برای ساخت فهرست، عنوان‌های <strong>h2</strong> یا <strong>h3</strong> به
+          سند اضافه کنید. سطوح فعال: {activeLevels.join("، ") || "—"}.
+          شماره صفحه‌ها در خروجی PDF به‌طور خودکار محاسبه و درج می‌شوند.
+        </div>
+      ) : (
+        <>
+          <ol
+            className="doc-toc-list"
+            style={{
+              listStyle: "none",
+              padding: 0,
+              margin: "8px 0 0",
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            {entries.map((e, idx) => {
+              const anchor = headingAnchor(e.id);
+              const indent = e.level === 1 ? 0 : e.level === 2 ? 18 : 36;
+              const isLvl1 = e.level === 1;
+              const isLvl2 = e.level === 2;
+              const isLvl3 = e.level === 3;
+              return (
+                <li
+                  key={e.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "baseline",
+                    gap: 8,
+                    padding: "4px 8px",
+                    borderRadius: 6,
+                    paddingInlineStart: indent + 8,
+                    color: isLvl1
+                      ? "#0c1a3b"
+                      : isLvl2
+                      ? "#1d4ed8"
+                      : "#475569",
+                    fontWeight: isLvl1 ? 700 : isLvl2 ? 600 : 400,
+                    fontSize: isLvl1 ? 14.5 : isLvl2 ? 13.5 : 13,
+                  }}
+                >
+                  <span
+                    style={{
+                      fontVariantNumeric: "tabular-nums",
+                      opacity: 0.55,
+                      minWidth: 20,
+                    }}
+                  >
+                    {(idx + 1).toLocaleString("fa-IR")}.
+                  </span>
+                  <a
+                    href={`#${anchor}`}
+                    style={{
+                      flex: 1,
+                      color: "inherit",
+                      textDecoration: "none",
+                    }}
+                  >
+                    {e.text || "(بدون عنوان)"}
+                  </a>
+                  <span
+                    style={{
+                      fontSize: 10.5,
+                      fontWeight: 700,
+                      color: isLvl1 ? "#1d4ed8" : isLvl2 ? "#6366f1" : "#94a3b8",
+                      padding: "1px 7px",
+                      borderRadius: 999,
+                      background: "rgba(255,255,255,0.7)",
+                      border: "1px solid rgba(148,163,184,0.24)",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {isLvl1 ? "زیرعنوان" : isLvl2 ? "h2" : "h3"}
+                  </span>
+                </li>
+              );
+            })}
+          </ol>
+          <div
+            style={{
+              marginTop: 10,
+              fontSize: 11,
+              color: "#94a3b8",
+              fontStyle: "italic",
+            }}
+          >
+            شماره صفحه‌ها در خروجی PDF/Word به‌طور خودکار محاسبه و درج می‌شوند.
+            سطوح فعال: {activeLevels.join("، ") || "—"}.
+          </div>
+        </>
+      )}
     </div>
   );
 }

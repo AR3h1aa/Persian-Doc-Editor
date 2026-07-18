@@ -722,6 +722,689 @@ export function countWordsAndChars(blocks: Block[]): { words: number; chars: num
   return { words, chars };
 }
 
+// =============================================================================
+// Round-trip TXT serialization
+// =============================================================================
+// Goal: serialize the full document (meta + all typed blocks, including tables,
+// code, images-as-alt-text, columns, footnotes, TOC config, glossary entries,
+// page breaks) to a plain .txt file that a human can still read, AND that
+// re-imports back into the editor with all block types restored.
+//
+// Format: a small, line-oriented set of markers. Every marker starts with `§`
+// (section sign) at the start of a line, which is unusual enough in normal
+// Persian / English prose that false matches are essentially impossible.
+//
+// Header:
+//   §DOC v1
+//   §META title=...
+//   §META author=...
+//   §META date=...
+//   §BLOCKS
+//
+// Per block (one line of header + body):
+//   §T type=<type> [fontSize=..] [blockWidth=..] [marginBottom=..]
+//   <body lines>
+//   §E
+//
+// Body encoding rules per type:
+//   - Text types: the text as-is (may span multiple lines).
+//   - bullet: one item per line, prefixed with `- `.
+//   - table: rows separated by `§R`, cells by `|` (cells cannot contain `|`,
+//     so we escape `\|`). Header flag is on the §T line as `header=1|0`.
+//   - code: the code as-is, lines preserved. Language on the §T line.
+//   - columns: column count on §T line as `cols=2|3`; each column separated by
+//     `§C`; items inside a column separated by `§I` followed by `type=...`
+//     and the item's text.
+//   - image: `src=...` is omitted (data URLs would bloat the file). We keep
+//     caption, alt, width, align so the user can re-attach an image later.
+//   - footnote: text body.
+//   - toc: title + flags on the §T line.
+//   - glossary: title + flags on §T line; entries follow as `§G word | meaning`.
+//   - pageBreak / divider / spacer: only §T line, no body.
+//
+// We also escape any body line that starts with `§` by prefixing `\§` so the
+// parser doesn't confuse it with a marker.
+
+const TXT_MAGIC = "§DOC v1";
+
+function escapeTxtLine(s: string): string {
+  // Escape lines that would confuse the parser
+  if (s.startsWith("§")) return "\\" + s;
+  return s;
+}
+function unescapeTxtLine(s: string): string {
+  if (s.startsWith("\\§")) return s.slice(1);
+  return s;
+}
+
+function fmtAttrs(attrs: Record<string, string | number | boolean | undefined>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v === undefined || v === "" || v === false) continue;
+    if (v === true) {
+      parts.push(`${k}=1`);
+    } else {
+      // Escape `|` and `\` in values so we can split later
+      const esc = String(v).replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+      parts.push(`${k}=${esc}`);
+    }
+  }
+  return parts.length ? " " + parts.join(" ") : "";
+}
+
+function parseAttrs(line: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  // line looks like: "§T type=paragraph fontSize=md marginBottom=12"
+  const m = line.match(/^§T\s+(.*)$/);
+  if (!m) return out;
+  const rest = m[1];
+  // Split on space but respect escaped spaces inside values
+  const tokens: string[] = [];
+  let buf = "";
+  let i = 0;
+  while (i < rest.length) {
+    const c = rest[i];
+    if (c === "\\" && i + 1 < rest.length) {
+      buf += c + rest[i + 1];
+      i += 2;
+      continue;
+    }
+    if (c === " ") {
+      if (buf) tokens.push(buf);
+      buf = "";
+      i++;
+      continue;
+    }
+    buf += c;
+    i++;
+  }
+  if (buf) tokens.push(buf);
+  for (const t of tokens) {
+    const eq = t.indexOf("=");
+    if (eq === -1) continue;
+    const k = t.slice(0, eq);
+    const v = t
+      .slice(eq + 1)
+      .replace(/\\(.)/g, (_m, c: string) => c);
+    out[k] = v;
+  }
+  return out;
+}
+
+// Serialize a single block to its TXT representation (header line + body lines + §E)
+function serializeBlockToTxt(block: Block): string[] {
+  const lines: string[] = [];
+  const baseAttrs: Record<string, string | number | boolean | undefined> = {
+    type: block.type,
+    fontSize: block.fontSize,
+    blockWidth: block.blockWidth,
+    marginBottom: block.marginBottom,
+  };
+
+  switch (block.type) {
+    case "title":
+    case "subtitle":
+    case "h2":
+    case "h3":
+    case "paragraph":
+    case "quote":
+    case "callout": {
+      lines.push(`§T${fmtAttrs(baseAttrs)}`);
+      for (const l of (block.text || "").split("\n")) {
+        lines.push(escapeTxtLine(l));
+      }
+      lines.push("§E");
+      break;
+    }
+    case "bullet": {
+      lines.push(`§T${fmtAttrs(baseAttrs)}`);
+      for (const item of block.items) {
+        for (const l of item.split("\n")) {
+          lines.push("- " + escapeTxtLine(l));
+        }
+      }
+      lines.push("§E");
+      break;
+    }
+    case "divider": {
+      lines.push(`§T${fmtAttrs(baseAttrs)}`);
+      lines.push("§E");
+      break;
+    }
+    case "pageBreak": {
+      lines.push(`§T${fmtAttrs(baseAttrs)}`);
+      lines.push("§E");
+      break;
+    }
+    case "spacer": {
+      lines.push(`§T${fmtAttrs({ ...baseAttrs, height: block.height })}`);
+      lines.push("§E");
+      break;
+    }
+    case "image": {
+      // Do not serialize the data URL (it can be megabytes). Keep metadata.
+      const attrs = {
+        ...baseAttrs,
+        caption: block.caption,
+        alt: block.alt,
+        width: block.width,
+        align: block.align,
+      };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      lines.push("[image src omitted — re-attach via image block editor]");
+      lines.push("§E");
+      break;
+    }
+    case "table": {
+      const attrs = { ...baseAttrs, header: block.hasHeader ? 1 : 0 };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      for (const row of block.rows) {
+        const escaped = row.map((c) => c.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " "));
+        lines.push("§R " + escaped.join(" | "));
+      }
+      lines.push("§E");
+      break;
+    }
+    case "code": {
+      const attrs = { ...baseAttrs, language: block.language };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      for (const l of (block.code || "").split("\n")) {
+        lines.push(escapeTxtLine(l));
+      }
+      lines.push("§E");
+      break;
+    }
+    case "footnote": {
+      lines.push(`§T${fmtAttrs({ ...baseAttrs, source: block.sourceBlockId })}`);
+      for (const l of (block.text || "").split("\n")) {
+        lines.push(escapeTxtLine(l));
+      }
+      lines.push("§E");
+      break;
+    }
+    case "toc": {
+      const attrs = {
+        ...baseAttrs,
+        title: block.title,
+        h2: block.includeH2 ? 1 : 0,
+        h3: block.includeH3 ? 1 : 0,
+        subtitle: block.includeSubtitle ? 1 : 0,
+      };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      lines.push("§E");
+      break;
+    }
+    case "glossary": {
+      const attrs = {
+        ...baseAttrs,
+        title: block.title,
+        autoDetect: block.autoDetect ? 1 : 0,
+        twoColumn: block.twoColumn ? 1 : 0,
+      };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      for (const e of block.entries) {
+        const word = e.word.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
+        const meaning = e.meaning.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\n/g, " ");
+        lines.push(`§G ${word} | ${meaning}`);
+      }
+      lines.push("§E");
+      break;
+    }
+    case "columns": {
+      const attrs = { ...baseAttrs, cols: block.columnCount };
+      lines.push(`§T${fmtAttrs(attrs)}`);
+      for (const col of block.columns) {
+        lines.push("§C");
+        for (const item of col) {
+          lines.push(`§I type=${item.type}`);
+          for (const l of (item.text || "").split("\n")) {
+            lines.push(escapeTxtLine(l));
+          }
+        }
+      }
+      lines.push("§E");
+      break;
+    }
+  }
+  return lines;
+}
+
+// Serialize a full document (meta + blocks) to a TXT string.
+export function serializeDocumentToTxt(meta: DocMeta, blocks: Block[]): string {
+  const lines: string[] = [];
+  lines.push(TXT_MAGIC);
+  lines.push(`§META title=${(meta.title || "").replace(/\n/g, " ")}`);
+  lines.push(`§META author=${(meta.author || "").replace(/\n/g, " ")}`);
+  lines.push(`§META date=${(meta.date || "").replace(/\n/g, " ")}`);
+  lines.push("§BLOCKS");
+  for (const b of blocks) {
+    lines.push(...serializeBlockToTxt(b));
+  }
+  return lines.join("\n") + "\n";
+}
+
+// Parse a TXT file produced by serializeDocumentToTxt back into meta + blocks.
+// If the file does not start with the §DOC marker, falls back to the legacy
+// parseTextToBlocks() behavior (so old .txt files still work).
+export function parseTxtToDocument(
+  text: string
+): { meta?: DocMeta; blocks: Block[]; isNative: boolean } {
+  const trimmed = text.replace(/^\uFEFF/, ""); // strip BOM
+  if (!trimmed.startsWith("§DOC")) {
+    return { blocks: parseTextToBlocks(trimmed), isNative: false };
+  }
+
+  const lines = trimmed.replace(/\r\n/g, "\n").split("\n");
+  const meta: DocMeta = { title: "", author: "", date: "" };
+  const blocks: Block[] = [];
+  let i = 0;
+
+  // Skip the magic line
+  if (lines[i]?.startsWith("§DOC")) i++;
+
+  // Parse META lines until §BLOCKS
+  while (i < lines.length && !lines[i].startsWith("§BLOCKS")) {
+    const line = lines[i];
+    if (line.startsWith("§META ")) {
+      const rest = line.slice("§META ".length);
+      const eq = rest.indexOf("=");
+      if (eq !== -1) {
+        const k = rest.slice(0, eq);
+        const v = rest.slice(eq + 1);
+        if (k === "title") meta.title = v;
+        else if (k === "author") meta.author = v;
+        else if (k === "date") meta.date = v;
+      }
+    }
+    i++;
+  }
+  if (lines[i]?.startsWith("§BLOCKS")) i++;
+
+  // Parse blocks
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.startsWith("§T ")) {
+      i++;
+      continue;
+    }
+    const attrs = parseAttrs(line);
+    const type = (attrs.type as BlockType) || "paragraph";
+    const fontSize = attrs.fontSize as FontSize | undefined;
+    const blockWidth = attrs.blockWidth as BlockWidth | undefined;
+    const marginBottom = attrs.marginBottom !== undefined
+      ? +attrs.marginBottom
+      : undefined;
+    const baseId = newId();
+    const style = { fontSize, blockWidth, marginBottom };
+
+    i++;
+    const bodyLines: string[] = [];
+    while (i < lines.length && !lines[i].startsWith("§E") && !lines[i].startsWith("§T ") && !lines[i].startsWith("§C") && !lines[i].startsWith("§I ") && !lines[i].startsWith("§G ") && !lines[i].startsWith("§R ")) {
+      bodyLines.push(unescapeTxtLine(lines[i]));
+      i++;
+    }
+
+    switch (type) {
+      case "title":
+      case "subtitle":
+      case "h2":
+      case "h3":
+      case "paragraph":
+      case "quote":
+      case "callout": {
+        blocks.push({
+          id: baseId,
+          type,
+          text: bodyLines.join("\n"),
+          ...style,
+        } as Block);
+        // consume §E
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "bullet": {
+        const items: string[] = [];
+        let currentItem: string[] = [];
+        for (const l of bodyLines) {
+          if (l.startsWith("- ")) {
+            if (currentItem.length > 0) items.push(currentItem.join("\n"));
+            currentItem = [l.slice(2)];
+          } else {
+            currentItem.push(l);
+          }
+        }
+        if (currentItem.length > 0) items.push(currentItem.join("\n"));
+        blocks.push({
+          id: baseId,
+          type: "bullet",
+          items: items.length > 0 ? items : [""],
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "divider": {
+        blocks.push({ id: baseId, type: "divider", ...style });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "pageBreak": {
+        blocks.push({ id: baseId, type: "pageBreak", ...style });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "spacer": {
+        const height = attrs.height !== undefined ? +attrs.height : 32;
+        blocks.push({ id: baseId, type: "spacer", height, ...style });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "image": {
+        blocks.push({
+          id: baseId,
+          type: "image",
+          src: "",
+          caption: attrs.caption || "",
+          alt: attrs.alt || "",
+          width: attrs.width !== undefined ? +attrs.width : 0,
+          align: (attrs.align as "start" | "center" | "end") || "center",
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "table": {
+        const rows: string[][] = [];
+        // bodyLines may contain §R lines we didn't consume (since they start with §R not §T)
+        // Re-scan from current line backward: bodyLines only got plain lines.
+        // We need to read §R lines separately.
+        const rawRows: string[] = [];
+        // First, check if bodyLines already captured them (it shouldn't have)
+        // Read forward from current line until §E
+        while (i < lines.length && !lines[i].startsWith("§E")) {
+          if (lines[i].startsWith("§R ")) {
+            rawRows.push(lines[i].slice("§R ".length));
+          }
+          i++;
+        }
+        for (const r of rawRows) {
+          // Split on | but respect \|
+          const cells: string[] = [];
+          let buf = "";
+          let j = 0;
+          while (j < r.length) {
+            const c = r[j];
+            if (c === "\\" && j + 1 < r.length) {
+              buf += r[j + 1];
+              j += 2;
+              continue;
+            }
+            if (c === "|") {
+              cells.push(buf.trim());
+              buf = "";
+              j++;
+              // skip the space after |
+              if (r[j] === " ") j++;
+              continue;
+            }
+            buf += c;
+            j++;
+          }
+          if (buf || cells.length > 0) cells.push(buf.trim());
+          if (cells.length > 0) rows.push(cells);
+        }
+        blocks.push({
+          id: baseId,
+          type: "table",
+          rows: rows.length > 0 ? rows : [["", ""]],
+          hasHeader: attrs.header === "1" || attrs.header === "true",
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "code": {
+        blocks.push({
+          id: baseId,
+          type: "code",
+          code: bodyLines.join("\n"),
+          language: attrs.language || "plain",
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "footnote": {
+        blocks.push({
+          id: baseId,
+          type: "footnote",
+          text: bodyLines.join("\n"),
+          sourceBlockId: attrs.source,
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "toc": {
+        blocks.push({
+          id: baseId,
+          type: "toc",
+          title: attrs.title || "فهرست مطالب",
+          includeH2: attrs.h2 !== "0",
+          includeH3: attrs.h3 !== "0",
+          includeSubtitle: attrs.subtitle === "1",
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "glossary": {
+        const entries: { id: string; word: string; meaning: string }[] = [];
+        // Read §G lines until §E
+        while (i < lines.length && !lines[i].startsWith("§E")) {
+          if (lines[i].startsWith("§G ")) {
+            const rest = lines[i].slice("§G ".length);
+            // Split on first unescaped |
+            let word = "";
+            let meaning = "";
+            let buf = "";
+            let j = 0;
+            let foundPipe = false;
+            while (j < rest.length) {
+              const c = rest[j];
+              if (c === "\\" && j + 1 < rest.length) {
+                buf += rest[j + 1];
+                j += 2;
+                continue;
+              }
+              if (c === "|" && !foundPipe) {
+                word = buf.trim();
+                buf = "";
+                foundPipe = true;
+                j++;
+                if (rest[j] === " ") j++;
+                continue;
+              }
+              buf += c;
+              j++;
+            }
+            if (foundPipe) {
+              meaning = buf.trim();
+            } else {
+              word = buf.trim();
+            }
+            entries.push({ id: newId(), word, meaning });
+          }
+          i++;
+        }
+        blocks.push({
+          id: baseId,
+          type: "glossary",
+          title: attrs.title || "لغت‌نامه",
+          entries,
+          autoDetect: attrs.autoDetect !== "0",
+          twoColumn: attrs.twoColumn === "1" || attrs.twoColumn === "true",
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      case "columns": {
+        const cols: TextBlock[][] = [];
+        let currentCol: TextBlock[] | null = null;
+        let currentItem: { type: BlockType; text: string[] } | null = null;
+        // Re-scan from after the §T line, reading §C / §I / body until §E
+        // Note: bodyLines above only captured non-marker lines, but for columns
+        // we want to re-walk from i forward. The bodyLines approach above
+        // already advanced i past body lines that don't start with § markers.
+        // So we need to also process bodyLines here, but in column mode bodyLines
+        // may be empty (because §C and §I are markers we stopped at).
+        // Strategy: collect all remaining lines until §E, then walk them.
+        const colLines: string[] = [];
+        // First append any bodyLines we captured (text lines before any §C)
+        colLines.push(...bodyLines);
+        while (i < lines.length && !lines[i].startsWith("§E")) {
+          colLines.push(lines[i]);
+          i++;
+        }
+        for (const l of colLines) {
+          if (l.startsWith("§C")) {
+            if (currentItem) {
+              currentCol!.push({
+                id: newId(),
+                type: currentItem.type as any,
+                text: currentItem.text.join("\n"),
+              } as TextBlock);
+              currentItem = null;
+            }
+            if (currentCol) cols.push(currentCol);
+            currentCol = [];
+            continue;
+          }
+          if (l.startsWith("§I ")) {
+            if (currentItem && currentCol) {
+              currentCol.push({
+                id: newId(),
+                type: currentItem.type as any,
+                text: currentItem.text.join("\n"),
+              } as TextBlock);
+            }
+            const itemAttrs = parseAttrs("§T " + l.slice("§I ".length));
+            currentItem = { type: (itemAttrs.type as BlockType) || "paragraph", text: [] };
+            continue;
+          }
+          // Plain body line for current item
+          if (currentItem) {
+            currentItem.text.push(unescapeTxtLine(l));
+          }
+        }
+        if (currentItem && currentCol) {
+          currentCol.push({
+            id: newId(),
+            type: currentItem.type as any,
+            text: currentItem.text.join("\n"),
+          } as TextBlock);
+        }
+        if (currentCol) cols.push(currentCol);
+        const colCount = (attrs.cols === "3" ? 3 : 2) as 2 | 3;
+        blocks.push({
+          id: baseId,
+          type: "columns",
+          columnCount: colCount,
+          columns: cols.length > 0 ? cols : [[{ id: newId(), type: "paragraph", text: "" }]],
+          ...style,
+        });
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+      default: {
+        // Unknown block type — skip to §E
+        while (i < lines.length && !lines[i].startsWith("§E")) i++;
+        if (lines[i]?.startsWith("§E")) i++;
+        break;
+      }
+    }
+  }
+
+  return { meta, blocks, isNative: true };
+}
+
+// =============================================================================
+// Saved snapshots — persistent named documents in localStorage
+// =============================================================================
+
+export interface SavedSnapshot {
+  id: string;
+  name: string;
+  savedAt: number; // epoch millis
+  meta: DocMeta;
+  blocks: Block[];
+}
+
+const SNAPSHOTS_KEY = "doc-editor-snapshots";
+
+export function loadSnapshots(): SavedSnapshot[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(SNAPSHOTS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr as SavedSnapshot[];
+  } catch {
+    return [];
+  }
+}
+
+export function saveSnapshot(name: string, meta: DocMeta, blocks: Block[]): SavedSnapshot {
+  const snap: SavedSnapshot = {
+    id: newId(),
+    name: name.trim() || "بدون نام",
+    savedAt: Date.now(),
+    meta: { ...meta },
+    blocks: JSON.parse(JSON.stringify(blocks)) as Block[],
+  };
+  const all = loadSnapshots();
+  all.unshift(snap);
+  // Cap at 50 snapshots to avoid filling localStorage
+  const capped = all.slice(0, 50);
+  if (typeof window !== "undefined") {
+    localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(capped));
+  }
+  return snap;
+}
+
+export function deleteSnapshot(id: string): void {
+  if (typeof window === "undefined") return;
+  const all = loadSnapshots();
+  const next = all.filter((s) => s.id !== id);
+  localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(next));
+}
+
+export function renameSnapshot(id: string, newName: string): void {
+  if (typeof window === "undefined") return;
+  const all = loadSnapshots();
+  const next = all.map((s) => (s.id === id ? { ...s, name: newName } : s));
+  localStorage.setItem(SNAPSHOTS_KEY, JSON.stringify(next));
+}
+
+// Format an epoch-millis timestamp as a Persian-relative string.
+export function formatSnapshotTime(t: number): string {
+  try {
+    const d = new Date(t);
+    return d.toLocaleString("fa-IR", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return "";
+  }
+}
+
+
 // Default starter document so the editor doesn't open empty.
 export function seedDocument(): { meta: DocMeta; blocks: Block[] } {
   const today = new Date();
