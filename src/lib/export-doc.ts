@@ -862,6 +862,54 @@ html, body {
   .doc-toc { break-inside: auto; }
   /* Ensure each heading doesn't get orphaned at page bottom */
   .doc-h2, .doc-h3 { break-after: avoid; }
+
+  /* ───────────────────────────────────────────────────────────────
+     IMAGE BLOCK — cap height so a single tall image never exceeds
+     one A4 page. Without this, the screen rule on .doc-image
+     (break-inside: avoid) pushes the entire figure (image + caption)
+     to the next page whenever it doesn't fit in the remaining space
+     on the current page, leaving a near-full-page gap on the previous
+     page and making the PDF/Word output much longer and harder to read.
+
+     Strategy:
+     1. Cap the img height to 22cm (A4 is 29.7cm; ~22cm leaves room
+        for the hero, the caption, and normal page margins).
+     2. Shrink-wrap the figure around the (now capped) image so we
+        don't leave a full-width row of whitespace around a portrait
+        image.
+     3. Keep break-inside: avoid on the figure so the caption stays
+        attached to the image.
+     ─────────────────────────────────────────────────────────────── */
+  .doc-image {
+    width: auto !important;
+    max-width: 100% !important;
+    break-inside: avoid;
+  }
+  .doc-image img {
+    max-height: 22cm !important;
+    width: auto !important;
+    max-width: 100% !important;
+    height: auto !important;
+    object-fit: contain !important;
+    margin: 0 auto;
+  }
+
+  /* ───────────────────────────────────────────────────────────────
+     LONG BLOCKS — let tables, glossary, and columns break across
+     pages instead of jumping to a new page when they don't fit.
+     For tables we still keep a single row + the header together so
+     rows don't split mid-cell.
+     ─────────────────────────────────────────────────────────────── */
+  .doc-table,
+  .doc-table tbody { break-inside: auto !important; }
+  .doc-table tr,
+  .doc-table thead { break-inside: avoid !important; }
+  .doc-table thead { break-after: avoid !important; }
+  .doc-glossary { break-inside: auto !important; }
+  .doc-columns { break-inside: auto !important; }
+  /* Word/MS Office-specific hints so long tables don't get forced
+     onto a new page in Word's own pagination. */
+  table { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
 }
 `.trim();
 }

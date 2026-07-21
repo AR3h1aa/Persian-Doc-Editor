@@ -1559,3 +1559,43 @@
   .dark .doc-paper,
   .dark .block-wrap { background: #fff !important; color: #0c1a3b !important; }
 }
+
+/* ===== TOC sidebar (right-side, Notion-style) ===== */
+.toc-sidebar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(99, 102, 241, 0.3) transparent;
+}
+.toc-sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+.toc-sidebar::-webkit-scrollbar-track {
+  background: transparent;
+}
+.toc-sidebar::-webkit-scrollbar-thumb {
+  background-color: rgba(99, 102, 241, 0.3);
+  border-radius: 3px;
+}
+.toc-sidebar::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(99, 102, 241, 0.5);
+}
+
+/* Flash highlight when jumping to a heading from the TOC sidebar */
+.toc-flash {
+  animation: toc-flash-pulse 1.2s ease-out;
+  border-radius: 6px;
+}
+@keyframes toc-flash-pulse {
+  0%   { background-color: rgba(99, 102, 241, 0.28); box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.18); }
+  35%  { background-color: rgba(99, 102, 241, 0.18); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.10); }
+  100% { background-color: transparent; box-shadow: 0 0 0 0 rgba(99, 102, 241, 0); }
+}
+
+/* Dark theme overrides for the TOC sidebar */
+.dark .toc-sidebar {
+  background: rgba(30, 41, 59, 0.78) !important;
+  border-color: rgba(99, 102, 241, 0.32) !important;
+  color: #cbd5e1;
+}
+.dark .toc-sidebar button {
+  color: #cbd5e1;
+}

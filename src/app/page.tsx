@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import {
   DndContext,
   DragEndEvent,
@@ -54,6 +54,8 @@ import {
   ChevronRight,
   Moon,
   Sun,
+  FileJson,
+  FileUp,
 } from "lucide-react";
 import BlockEditor from "@/components/doc/BlockEditor";
 import {
@@ -68,7 +70,6 @@ import {
   convertBlock,
   countWordsAndChars,
   collectTocEntries,
-  deleteSnapshot,
   detectEnglishWords,
   formatSnapshotTime,
   headingAnchor,
@@ -79,13 +80,21 @@ import {
   parseHtmlToBlocks,
   parseTextToBlocks,
   parseTxtToDocument,
-  renameSnapshot,
-  saveSnapshot,
   seedDocument,
   serializeDocumentToTxt,
   syncGlossaryEntries,
 } from "@/lib/doc-types";
 import { exportToPdf, exportToWord } from "@/lib/export-doc";
+import {
+  deleteSnapshotFromDb,
+  exportPordFile,
+  importPordFile,
+  loadAllSnapshots,
+  loadAutosaveState,
+  renameSnapshotInDb,
+  saveAutosaveState,
+  saveSnapshotToDb,
+} from "@/lib/storage";
 
 type ViewMode = "edit" | "preview";
 
@@ -111,6 +120,11 @@ export default function Home() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [pasteHint, setPasteHint] = useState<string | null>(null);
+  // ===== TOC sidebar (right-side, Notion-style) =====
+  // Vertical list of heading anchors; clicking scrolls the matching heading
+  // into view and (if needed) jumps to the editor page containing it.
+  const [tocCollapsed, setTocCollapsed] = useState(false);
+  const [activeHeadingId, setActiveHeadingId] = useState<string | null>(null);
 
   // ===== Editor pagination =====
   // Splits the long block list into A4-style pages with prev/next navigation.
@@ -130,10 +144,21 @@ export default function Home() {
   const [snapshotName, setSnapshotName] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const txtInputRef = useRef<HTMLInputElement>(null);
+  const jsonInputRef = useRef<HTMLInputElement>(null);
   const pendingImageIdRef = useRef<string | null>(null);
   const addMenuRef = useRef<HTMLDivElement>(null);
   const snapshotsPanelRef = useRef<HTMLDivElement>(null);
   const saveDialogRef = useRef<HTMLDivElement>(null);
+
+  // ===== Typing detection — pause autosave while user is actively typing =====
+  // Set to Date.now() on every keydown/input on a contentEditable or text input
+  // inside the editor surface. Both the debounced save and the periodic 60s
+  // timer consult this — if the user typed within the last 2.5 seconds, the
+  // save is deferred until they pause.
+  const lastTypingAtRef = useRef<number>(0);
+  const deferredSaveTimerRef = useRef<number | null>(null);
+  const isTypingRef = useRef<boolean>(false);
+  const [isTyping, setIsTyping] = useState<boolean>(false);
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -148,6 +173,45 @@ export default function Home() {
   const pageStart = safePage * BLOCKS_PER_PAGE;
   const pageEnd = Math.min(pageStart + BLOCKS_PER_PAGE, blocks.length);
   const pageBlocks = blocks.slice(pageStart, pageEnd);
+
+  // ===== TOC entries (Notion-style right sidebar) =====
+  // Collect all heading-like blocks across the WHOLE document (not just the
+  // current page) so the sidebar always shows the full outline.
+  const tocEntries = useMemo(
+    () =>
+      collectTocEntries(blocks, {
+        includeSubtitle: true,
+        includeH2: true,
+        includeH3: true,
+      }),
+    [blocks]
+  );
+
+  // Jump to the editor page containing the block with the given id, then
+  // scroll the heading element into view. Used by the TOC sidebar clicks.
+  function jumpToHeading(blockId: string) {
+    const idx = blocks.findIndex((b) => b.id === blockId);
+    if (idx < 0) return;
+    const targetPage = Math.floor(idx / BLOCKS_PER_PAGE);
+    if (targetPage !== safePage) {
+      setEditorPage(targetPage);
+    }
+    // Defer the scroll until after the page has rendered. Two rAFs are more
+    // reliable than one when the page change triggers a heavy re-render.
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const anchor = headingAnchor(blockId);
+        const el = document.getElementById(anchor) as HTMLElement | null;
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "start" });
+          // Briefly highlight so the user sees where they landed.
+          el.classList.add("toc-flash");
+          window.setTimeout(() => el.classList.remove("toc-flash"), 1200);
+        }
+        setActiveHeadingId(blockId);
+      });
+    });
+  }
 
   // When blocks count changes, keep editorPage in range.
   useEffect(() => {
@@ -181,17 +245,38 @@ export default function Home() {
     setEditorPage(Math.min(targetPage, totalPages)); // totalPages was computed before insert; clamp via effect
   }
 
+  // ===== Load saved state from IndexedDB on mount =====
+  // IndexedDB is async, so we kick off the load on mount and apply the result
+  // once it resolves. Falls back to localStorage for backward-compat with
+  // older sessions that saved their state there before the IndexedDB migration.
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem("doc-editor-state");
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed.meta) setMeta(parsed.meta);
-        if (Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
-          setBlocks(parsed.blocks);
+    let cancelled = false;
+    (async () => {
+      try {
+        const rec = await loadAutosaveState();
+        if (cancelled) return;
+        if (rec && rec.blocks && rec.blocks.length > 0) {
+          setMeta(rec.meta);
+          setBlocks(rec.blocks);
+          setSavedAt(new Date(rec.savedAt).toLocaleTimeString("fa-IR"));
+          return;
         }
-      }
-    } catch {}
+      } catch {}
+      // Fallback: legacy localStorage state from before the IndexedDB migration
+      try {
+        const raw = localStorage.getItem("doc-editor-state");
+        if (raw && !cancelled) {
+          const parsed = JSON.parse(raw);
+          if (parsed.meta) setMeta(parsed.meta);
+          if (Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
+            setBlocks(parsed.blocks);
+          }
+        }
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // ===== Dark theme: load preference + apply to <html> =====
@@ -212,37 +297,164 @@ export default function Home() {
     } catch {}
   }, [darkTheme]);
 
-  useEffect(() => {
-    const id = setTimeout(() => {
-      try {
-        localStorage.setItem("doc-editor-state", JSON.stringify({ meta, blocks }));
-        setSavedAt(new Date().toLocaleTimeString("fa-IR"));
-      } catch {}
-    }, 600);
-    return () => clearTimeout(id);
-  }, [meta, blocks]);
-
-  // ===== Periodic autosave (every 60 seconds) =====
-  // Keeps a live ref to the latest state so the interval callback always sees
-  // up-to-date data without re-subscribing on every keystroke.
+  // ===== Live ref to the latest state so async callbacks (image paste,
+  // force-save, periodic timer) always see up-to-date data without
+  // re-subscribing on every keystroke.
   const latestStateRef = useRef({ meta, blocks });
   useEffect(() => {
     latestStateRef.current = { meta, blocks };
   }, [meta, blocks]);
 
+  // ===== Helper: actually write current state to IndexedDB =====
+  const persistToIndexedDb = useCallback(async (m: DocMeta, bs: Block[]) => {
+    try {
+      await saveAutosaveState(m, bs);
+      setSavedAt(new Date().toLocaleTimeString("fa-IR"));
+    } catch (e) {
+      // IndexedDB rarely throws, but if it does (e.g. user in private mode
+      // with storage disabled), fall back to localStorage so we don't lose
+      // the save entirely.
+      try {
+        localStorage.setItem(
+          "doc-editor-state",
+          JSON.stringify({ meta: m, blocks: bs })
+        );
+        setSavedAt(new Date().toLocaleTimeString("fa-IR"));
+      } catch {}
+    }
+  }, []);
+
+  // ===== Force-save: write the LATEST blocks to IndexedDB right now,
+  // regardless of typing state. Used after image paste, image upload,
+  // snapshot load, JSON import, block insertion/deletion — anything where
+  // the state change is asynchronous and we cannot afford to lose it.
+  //
+  // We use a ref to the latest blocks/meta so callers don't have to pass
+  // them in (and risk passing stale values captured at handler-creation time).
+  const flushSaveNow = useCallback(async () => {
+    const { meta: m, blocks: bs } = latestStateRef.current;
+    // Also clear the typing flag and cancel any pending deferred save so we
+    // don't double-write moments later.
+    if (deferredSaveTimerRef.current) {
+      window.clearTimeout(deferredSaveTimerRef.current);
+      deferredSaveTimerRef.current = null;
+    }
+    isTypingRef.current = false;
+    setIsTyping(false);
+    await persistToIndexedDb(m, bs);
+  }, [persistToIndexedDb]);
+
+  // ===== Debounced autosave (fires shortly after a change) =====
+  // Key behaviour: if the user is actively typing, we DEFER the save — the
+  // typing-pause watcher (below) commits once they pause for 30 seconds.
+  // This prevents autosave from interrupting mid-word typing (which was
+  // causing the contentEditable to lose focus and drop what the user had
+  // just typed).
+  useEffect(() => {
+    // If the user is currently typing, hold off — a separate effect (below)
+    // watches the typing flag and triggers the save once they pause.
+    if (isTypingRef.current) return;
+    const id = window.setTimeout(() => {
+      persistToIndexedDb(meta, blocks);
+    }, 600);
+    return () => window.clearTimeout(id);
+  }, [meta, blocks, persistToIndexedDb]);
+
+  // ===== Typing-pause watcher =====
+  // When isTyping flips true, set up a deferred save that fires once the user
+  // hasn't typed for 30s. This keeps the "typing" indicator alive and prevents
+  // any save-induced re-render from interrupting long-form writing sessions.
+  // (Shorter pauses like 2.5s were too aggressive and caused the editor to
+  // feel janky during continuous typing.)
+  useEffect(() => {
+    if (!isTyping) return;
+    if (deferredSaveTimerRef.current) {
+      window.clearTimeout(deferredSaveTimerRef.current);
+    }
+    deferredSaveTimerRef.current = window.setTimeout(() => {
+      // User has paused typing — flush the save and clear the typing flag.
+      isTypingRef.current = false;
+      setIsTyping(false);
+      persistToIndexedDb(meta, blocks);
+    }, 30_000);
+    return () => {
+      if (deferredSaveTimerRef.current) {
+        window.clearTimeout(deferredSaveTimerRef.current);
+        deferredSaveTimerRef.current = null;
+      }
+    };
+  }, [isTyping, meta, blocks, persistToIndexedDb]);
+
+  // ===== Global typing detector =====
+  // Listen for keydown and input events on contentEditable elements and text
+  // inputs inside the document surface. Mark isTyping = true and refresh
+  // lastTypingAtRef on each event.
+  useEffect(() => {
+    const markTyping = () => {
+      lastTypingAtRef.current = Date.now();
+      if (!isTypingRef.current) {
+        isTypingRef.current = true;
+        setIsTyping(true);
+      }
+    };
+    const onKeydown = (e: KeyboardEvent) => {
+      // Only mark typing for printable keys; ignore modifier-only presses,
+      // arrow keys, F-keys, etc.
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const isEditable =
+        target.isContentEditable ||
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA";
+      if (!isEditable) return;
+      // Ignore pure navigation keys so the user can move the cursor without
+      // triggering a "typing" pause-then-save cycle.
+      const navKeys = new Set([
+        "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+        "Home", "End", "PageUp", "PageDown", "Tab", "Escape",
+      ]);
+      if (navKeys.has(e.key)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      markTyping();
+    };
+    const onInput = (e: Event) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const isEditable =
+        target.isContentEditable ||
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA";
+      if (!isEditable) return;
+      markTyping();
+    };
+    document.addEventListener("keydown", onKeydown, true);
+    document.addEventListener("input", onInput, true);
+    return () => {
+      document.removeEventListener("keydown", onKeydown, true);
+      document.removeEventListener("input", onInput, true);
+    };
+  }, []);
+
+  // ===== Periodic autosave (every 60 seconds) =====
   useEffect(() => {
     const id = window.setInterval(() => {
+      // ===== Don't interrupt active typing =====
+      // If the user is currently flagged as typing, skip this tick entirely
+      // — the 30s typing-pause watcher will handle the commit when they
+      // actually stop. We deliberately don't force-flush here, because doing
+      // so would re-render the editor mid-typing and could drop the
+      // just-typed characters.
+      if (isTypingRef.current) {
+        return;
+      }
+
       // Show "saving" state with spin animation
       setAutosavePulse("saving");
       setAutosaveToastVisible(true);
 
-      // Save to localStorage (same key as the debounced autosave)
-      try {
-        const { meta: m, blocks: bs } = latestStateRef.current;
-        localStorage.setItem("doc-editor-state", JSON.stringify({ meta: m, blocks: bs }));
-        const now = new Date().toLocaleTimeString("fa-IR");
-        setSavedAt(now);
-      } catch {}
+      // Save to IndexedDB (async)
+      const { meta: m, blocks: bs } = latestStateRef.current;
+      persistToIndexedDb(m, bs);
 
       // After ~700ms, switch to "done" state with check icon
       window.setTimeout(() => {
@@ -264,8 +476,62 @@ export default function Home() {
       if (autosaveToastTimerRef.current) {
         window.clearTimeout(autosaveToastTimerRef.current);
       }
+      if (deferredSaveTimerRef.current) {
+        window.clearTimeout(deferredSaveTimerRef.current);
+      }
     };
+  }, [persistToIndexedDb]);
+
+  // ===== beforeunload: flush any unsaved state to IndexedDB before the
+  // tab closes / reloads. IndexedDB writes complete synchronously enough
+  // for this to work in practice on a beforeunload handler — the request
+  // is queued and the browser keeps the event loop alive long enough to
+  // flush it. We also write to localStorage as a synchronous backup.
+  useEffect(() => {
+    const handler = () => {
+      try {
+        const { meta: m, blocks: bs } = latestStateRef.current;
+        // Synchronous localStorage backup — guarantees data survives even
+        // if the async IndexedDB write doesn't complete before unload.
+        localStorage.setItem(
+          "doc-editor-state",
+          JSON.stringify({ meta: m, blocks: bs })
+        );
+        // Best-effort IndexedDB write (may or may not complete in time).
+        saveAutosaveState(m, bs).catch(() => {});
+      } catch {}
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
   }, []);
+
+  // ===== visibilitychange: when the user switches tabs or minimizes the
+  // browser, treat it as a typing pause and flush the save immediately.
+  // This catches the case where the user pastes an image and quickly
+  // switches to another tab to grab another screenshot.
+  useEffect(() => {
+    const handler = () => {
+      if (document.visibilityState === "hidden") {
+        flushSaveNow();
+      }
+    };
+    document.addEventListener("visibilitychange", handler);
+    return () => document.removeEventListener("visibilitychange", handler);
+  }, [flushSaveNow]);
+
+  // ===== Blur-flush: REMOVED =====
+  // An earlier version flushed the save on every focusout (blur) of a
+  // contentEditable. This caused the editor to lose just-typed text in
+  // some scenarios: even with requestAnimationFrame deferral, the
+  // setIsTyping(false) re-render would race with React 19's synthetic
+  // onBlur and could re-apply dangerouslySetInnerHTML with stale text.
+  // Now we rely on:
+  //   1. The 30s typing-pause watcher (commits when user pauses for 30s)
+  //   2. visibilitychange (commits when user switches tab / minimizes)
+  //   3. beforeunload (commits synchronously to localStorage + best-effort IDB)
+  //   4. Per-handler flushSaveNow() calls after image paste / upload / import
+  // These four layers are sufficient to prevent data loss while keeping
+  // the typing experience smooth.
 
   useEffect(() => {
     if (!showAddMenu) return;
@@ -290,9 +556,39 @@ export default function Home() {
     return () => clearTimeout(t);
   }, [pasteHint]);
 
-  // Load saved snapshots from localStorage on mount
+  // Load saved snapshots from IndexedDB on mount. Fall back to localStorage
+  // for one-time migration of any snapshots saved before the IndexedDB switch.
   useEffect(() => {
-    setSnapshots(loadSnapshots());
+    let cancelled = false;
+    (async () => {
+      try {
+        const fromDb = await loadAllSnapshots();
+        if (cancelled) return;
+        if (fromDb.length > 0) {
+          setSnapshots(fromDb);
+          return;
+        }
+      } catch {}
+      // Legacy fallback: load from localStorage and (best-effort) migrate to
+      // IndexedDB so future saves land in the new store.
+      try {
+        const legacy = loadSnapshots();
+        if (cancelled) return;
+        setSnapshots(legacy);
+        if (legacy.length > 0) {
+          // Best-effort migration; if it fails we just keep the localStorage
+          // copy in memory for this session.
+          for (const snap of legacy) {
+            try {
+              await saveSnapshotToDb(snap.name, snap.meta, snap.blocks);
+            } catch {}
+          }
+        }
+      } catch {}
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Click-outside handler for the snapshots panel and save dialog
@@ -520,6 +816,9 @@ export default function Home() {
             : b
         )
       );
+      // Force-save so the uploaded image survives even if the user
+      // immediately closes the tab.
+      requestAnimationFrame(() => flushSaveNow());
       showToast("عکس اضافه شد ✓");
     };
     reader.readAsDataURL(file);
@@ -585,6 +884,11 @@ export default function Home() {
       const cloned = deepCloneBlock(parsed.block as Block);
       setBlocks((prev) => [...prev, cloned]);
       showToast("بلوک از کلیپ‌بورد پیست شد ✓");
+      // If the pasted block is an image (with a large base64 src), force-save
+      // so the data survives even if the user immediately closes the tab.
+      if (cloned.type === "image") {
+        requestAnimationFrame(() => flushSaveNow());
+      }
     } catch {
       showToast("خطا در خواندن کلیپ‌بورد — لطفاً دوباره تلاش کنید");
     }
@@ -603,6 +907,15 @@ export default function Home() {
     if (!dt) return;
 
     // ----- 1. Image paste -----
+    // Image paste is special: the FileReader is async, so the actual setBlocks
+    // call happens ~100-500ms after this function returns. The debounced
+    // autosave effect would normally pick it up, but if the user is mid-typing
+    // OR if they paste another image quickly OR close the tab before the
+    // reader fires, the image would be lost. We solve this by:
+    //   (a) collecting all image Files first,
+    //   (b) reading them with Promise.all so we know when ALL are done,
+    //   (c) committing all new image blocks in a single setBlocks call,
+    //   (d) immediately calling flushSaveNow() to force-save to IndexedDB.
     const imageItems: DataTransferItem[] = [];
     for (let i = 0; i < dt.items.length; i++) {
       const it = dt.items[i];
@@ -610,35 +923,59 @@ export default function Home() {
     }
     if (imageItems.length > 0) {
       e.preventDefault();
-      // Find the focused block (if any)
       const focusId = focusedBlockId();
-      imageItems.forEach((it) => {
-        const file = it.getAsFile();
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = () => {
-          const dataUrl = reader.result as string;
-          const newBlock: ImageBlock = {
+
+      // Convert each DataTransferItem to a Promise that resolves to a
+      // base64 data URL string.
+      const readFileAsDataUrl = (file: File): Promise<string> =>
+        new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(file);
+        });
+
+      // Kick off all reads in parallel, then commit them all in one batch.
+      (async () => {
+        try {
+          const files = imageItems
+            .map((it) => it.getAsFile())
+            .filter((f): f is File => !!f);
+          const dataUrls = await Promise.all(
+            files.map((f) => readFileAsDataUrl(f))
+          );
+          const newBlocks: ImageBlock[] = dataUrls.map((src, i) => ({
             id: newId(),
-            type: "image",
-            src: dataUrl,
+            type: "image" as const,
+            src,
             caption: "",
-            alt: file.name || "عکس پیست‌شده",
+            alt: files[i].name || "عکس پیست‌شده",
             width: 0,
-            align: "center",
-          };
+            align: "center" as const,
+          }));
           setBlocks((prev) => {
-            if (!focusId) return [...prev, newBlock];
+            if (!focusId) return [...prev, ...newBlocks];
             const idx = prev.findIndex((b) => b.id === focusId);
-            if (idx === -1) return [...prev, newBlock];
+            if (idx === -1) return [...prev, ...newBlocks];
             const next = [...prev];
-            next.splice(idx + 1, 0, newBlock);
+            next.splice(idx + 1, 0, ...newBlocks);
             return next;
           });
-        };
-        reader.readAsDataURL(file);
-      });
-      showToast(`${imageItems.length} عکس از کلیپ‌بورد پیست شد ✓`);
+          // ===== Force-save immediately so the pasted images can't be lost
+          // even if the user closes the tab a millisecond later.
+          // flushSaveNow reads from latestStateRef, but latestStateRef is
+          // updated by a useEffect that fires AFTER setBlocks — so we need
+          // to wait one tick for the ref to refresh before flushing.
+          // Using requestAnimationFrame is more reliable than setTimeout(0)
+          // here because it fires after the next render commit.
+          requestAnimationFrame(() => {
+            flushSaveNow();
+          });
+          showToast(`${newBlocks.length} عکس از کلیپ‌بورد پیست شد ✓`);
+        } catch (err) {
+          showToast("خطا در خواندن عکس از کلیپ‌بورد");
+        }
+      })();
       return;
     }
 
@@ -767,12 +1104,21 @@ export default function Home() {
     setShowSnapshots(false);
   }
 
-  function confirmSaveSnapshot() {
+  async function confirmSaveSnapshot() {
     const name = snapshotName.trim() || "بدون نام";
-    saveSnapshot(name, meta, blocks);
-    setSnapshots(loadSnapshots());
-    setShowSaveDialog(false);
-    showToast(`«${name}» ذخیره شد ✓`);
+    try {
+      await saveSnapshotToDb(name, meta, blocks);
+      const refreshed = await loadAllSnapshots();
+      setSnapshots(refreshed);
+      setShowSaveDialog(false);
+      showToast(`«${name}» ذخیره شد ✓`);
+    } catch (e) {
+      showToast(
+        `ذخیره ناموفق بود: ${
+          e instanceof Error ? e.message : "خطای ناشناخته"
+        }`
+      );
+    }
   }
 
   function loadSnapshotById(id: string) {
@@ -784,25 +1130,37 @@ export default function Home() {
     setShowSnapshots(false);
     showToast(`«${snap.name}» بارگذاری شد ✓`);
     setTimeout(() => window.scrollTo({ top: 0, behavior: "smooth" }), 50);
+    // Force-save so the loaded snapshot becomes the new autosave state.
+    requestAnimationFrame(() => flushSaveNow());
   }
 
-  function removeSnapshot(id: string) {
+  async function removeSnapshot(id: string) {
     const snap = snapshots.find((s) => s.id === id);
     if (!snap) return;
     if (!confirm(`سند ذخیره‌شده «${snap.name}» حذف شود؟`)) return;
-    deleteSnapshot(id);
-    setSnapshots(loadSnapshots());
-    showToast("سند ذخیره‌شده حذف شد");
+    try {
+      await deleteSnapshotFromDb(id);
+      const refreshed = await loadAllSnapshots();
+      setSnapshots(refreshed);
+      showToast("سند ذخیره‌شده حذف شد");
+    } catch (e) {
+      showToast("حذف ناموفق بود");
+    }
   }
 
-  function renameSnapshotById(id: string) {
+  async function renameSnapshotById(id: string) {
     const snap = snapshots.find((s) => s.id === id);
     if (!snap) return;
     const newName = prompt("نام جدید را وارد کنید:", snap.name);
     if (newName === null || newName.trim() === "") return;
-    renameSnapshot(id, newName.trim());
-    setSnapshots(loadSnapshots());
-    showToast("نام تغییر کرد ✓");
+    try {
+      await renameSnapshotInDb(id, newName.trim());
+      const refreshed = await loadAllSnapshots();
+      setSnapshots(refreshed);
+      showToast("نام تغییر کرد ✓");
+    } catch (e) {
+      showToast("تغییر نام ناموفق بود");
+    }
   }
 
   // ===== Export TXT (round-trip native format) =====
@@ -822,6 +1180,63 @@ export default function Home() {
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 1000);
     showToast("خروجی TXT ساخته شد — با ایمپورت txt قابل بازیابی است ✓");
+  }
+
+  // ===== Export JSON (.pord.json) — full project file with images =====
+  // Unlike TXT, this format preserves embedded image data (base64), block
+  // types, and all metadata, so a project can be moved between machines /
+  // browsers without losing anything.
+  function handleExportJson() {
+    try {
+      exportPordFile(meta, blocks);
+      const imgCount = blocks.filter((b) => b.type === "image").length;
+      showToast(
+        `فایل پروژه ساخته شد ✓ (${blocks.length} بلوک${
+          imgCount > 0 ? `، ${imgCount} عکس` : ""
+        })`
+      );
+    } catch (e) {
+      showToast(
+        `خروجی ناموفق بود: ${e instanceof Error ? e.message : "خطا"}`
+      );
+    }
+  }
+
+  // ===== Import JSON (.pord.json) — restore a full project from file =====
+  async function handleJsonChosen(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    const result = await importPordFile(file);
+    if (!result.ok || !result.meta || !result.blocks) {
+      showToast(result.error || "خواندن فایل ناموفق بود");
+      return;
+    }
+    if (result.blocks.length === 0) {
+      showToast("فایل خالی است");
+      return;
+    }
+    const imgCount = result.blocks.filter((b) => b.type === "image").length;
+    const replace = confirm(
+      `${result.blocks.length} بلوک از فایل پروژه خوانده شد${
+        imgCount > 0 ? ` (${imgCount} عکس)` : ""
+      }.\n\nOK = جایگزینی کل سند فعلی\nCancel = افزودن به انتهای سند فعلی`
+    );
+    if (replace) {
+      setMeta(result.meta);
+      setBlocks(result.blocks);
+    } else {
+      setBlocks((prev) => [...prev, ...result.blocks!]);
+    }
+    showToast(
+      `${result.blocks.length} بلوک از فایل پروژه بارگذاری شد${
+        imgCount > 0 ? ` (${imgCount} عکس)` : ""
+      } ✓`
+    );
+    // Force-save so the imported project (with all its images) immediately
+    // becomes the new autosave state — never rely on the debounced timer
+    // for a load operation, since the user might close the tab right after.
+    requestAnimationFrame(() => flushSaveNow());
   }
 
   // ===== Updated TXT import — detects native format and restores blocks =====
@@ -849,6 +1264,7 @@ export default function Home() {
           setBlocks((prev) => [...prev, ...result.blocks]);
         }
         showToast(`${result.blocks.length} بلوک از فایل بازیابی شد ✓`);
+        requestAnimationFrame(() => flushSaveNow());
       } else {
         // Legacy plain-text file — parse with markdown heuristics
         const parsed = result.blocks;
@@ -864,6 +1280,7 @@ export default function Home() {
           setBlocks((prev) => [...prev, ...parsed]);
         }
         showToast(`${parsed.length} بلوک ایمپورت شد ✓`);
+        requestAnimationFrame(() => flushSaveNow());
       }
     };
     reader.readAsText(file);
@@ -1114,6 +1531,28 @@ export default function Home() {
           <button
             type="button"
             className="tool-pill ghost"
+            onClick={() => jsonInputRef.current?.click()}
+            title="باز کردن فایل پروژه (.pord.json) — شامل تمام عکس‌ها و بلوک‌ها. برای انتقال پروژه بین دستگاه‌ها"
+            style={{ background: "rgba(99,102,241,0.10)", borderColor: "rgba(99,102,241,0.35)", color: "#4338ca" }}
+          >
+            <FileUp size={14} />
+            <span>باز کردن پروژه</span>
+          </button>
+
+          <button
+            type="button"
+            className="tool-pill ghost"
+            onClick={handleExportJson}
+            title="ذخیره‌ی کل پروژه در یک فایل (.pord.json) با تمام عکس‌ها و بلوک‌ها. برای انتقال بین دستگاه‌ها یا بک‌آپ"
+            style={{ background: "rgba(99,102,241,0.10)", borderColor: "rgba(99,102,241,0.35)", color: "#4338ca" }}
+          >
+            <FileJson size={14} />
+            <span>ذخیره پروژه</span>
+          </button>
+
+          <button
+            type="button"
+            className="tool-pill ghost"
             onClick={openSaveDialog}
             data-snapshot-toggle="save"
             title="ذخیره‌ی نسخه‌ی فعلی سند برای ویرایش بعدی"
@@ -1128,7 +1567,7 @@ export default function Home() {
               className="tool-pill ghost"
               onClick={() => {
                 setShowSnapshots((v) => !v);
-                setSnapshots(loadSnapshots());
+                loadAllSnapshots().then(setSnapshots).catch(() => {});
               }}
               data-snapshot-toggle="open"
               title="سندهای ذخیره‌شده قبلی"
@@ -1534,7 +1973,11 @@ export default function Home() {
         >
           <span style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
             <Save size={13} />
-            {savedAt ? `ذخیره خودکار در ${savedAt}` : "ذخیره خودکار فعال"}
+            {isTyping
+              ? "در حال تایپ... ذخیره موقتاً متوقف شد"
+              : savedAt
+              ? `ذخیره خودکار در ${savedAt}`
+              : "ذخیره خودکار فعال"}
           </span>
           <span style={{ color: "#cbd5e1" }}>•</span>
           <span>{blocks.length} بلوک</span>
@@ -1604,12 +2047,239 @@ export default function Home() {
         </div>
       )}
 
-      {/* ===== Main canvas ===== */}
-      <main
+      {/* ===== Main canvas + right-side TOC sidebar ===== */}
+      <div
         style={{
+          display: "flex",
+          flexDirection: "row",
+          alignItems: "flex-start",
+          justifyContent: "center",
+          gap: "1rem",
           width: "min(1280px, 94vw)",
           margin: "1rem auto 4rem",
           flex: "1 0 auto",
+        }}
+      >
+        {/* TOC sidebar (visual right in RTL) */}
+        {view === "edit" && tocEntries.length > 0 && (
+          <aside
+            className="toc-sidebar"
+            style={{
+              width: tocCollapsed ? 44 : 220,
+              flexShrink: 0,
+              position: "sticky",
+              top: 80,
+              alignSelf: "flex-start",
+              maxHeight: "calc(100vh - 100px)",
+              overflowY: "auto",
+              background: "rgba(255,255,255,0.72)",
+              backdropFilter: "blur(10px)",
+              border: "1px solid rgba(99,102,241,0.18)",
+              borderRadius: 12,
+              padding: tocCollapsed ? "8px 4px" : "10px 8px",
+              boxShadow: "0 4px 16px rgba(15,23,42,0.06)",
+              transition: "width 0.18s ease, padding 0.18s ease",
+            }}
+          >
+            {/* Header row: title + collapse toggle */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: 6,
+                padding: tocCollapsed ? "0 0 6px" : "0 6px 8px",
+                borderBottom: tocCollapsed ? "none" : "1px solid rgba(99,102,241,0.14)",
+                marginBottom: tocCollapsed ? 0 : 6,
+              }}
+            >
+              {!tocCollapsed && (
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: "#4338ca",
+                    letterSpacing: "0.3px",
+                  }}
+                >
+                  <ListTree size={13} />
+                  <span>فهرست تیترها</span>
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => setTocCollapsed((v) => !v)}
+                aria-label={tocCollapsed ? "بازکردن فهرست" : "بستن فهرست"}
+                title={tocCollapsed ? "بازکردن فهرست" : "بستن فهرست"}
+                style={{
+                  display: "grid",
+                  placeItems: "center",
+                  width: 24,
+                  height: 24,
+                  borderRadius: 6,
+                  border: "1px solid rgba(99,102,241,0.2)",
+                  background: "#fff",
+                  color: "#4338ca",
+                  cursor: "pointer",
+                  marginInlineStart: "auto",
+                  fontFamily: "inherit",
+                }}
+              >
+                {tocCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
+              </button>
+            </div>
+
+            {/* Vertical "lines" list — Notion-style row of pill bars */}
+            {!tocCollapsed && (
+              <ul
+                style={{
+                  listStyle: "none",
+                  margin: 0,
+                  padding: 0,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 2,
+                }}
+              >
+                {tocEntries.map((entry) => {
+                  const isActive = activeHeadingId === entry.id;
+                  // Indentation by heading level (1 = subtitle, 2 = h2, 3 = h3).
+                  const indent = (entry.level - 1) * 12;
+                  // Color stripe by level.
+                  const stripeColor =
+                    entry.level === 1
+                      ? "linear-gradient(180deg, #6366f1, #4338ca)"
+                      : entry.level === 2
+                      ? "linear-gradient(180deg, #38bdf8, #0284c7)"
+                      : "linear-gradient(180deg, #fb923c, #ea580c)";
+                  const text =
+                    entry.text && entry.text.trim().length > 0
+                      ? entry.text.trim()
+                      : "(بدون متن)";
+                  return (
+                    <li key={entry.id}>
+                      <button
+                        type="button"
+                        onClick={() => jumpToHeading(entry.id)}
+                        title={text}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          width: "100%",
+                          padding: "5px 8px 5px 6px",
+                          marginInlineStart: indent,
+                          borderRadius: 6,
+                          border: "none",
+                          background: isActive
+                            ? "rgba(99,102,241,0.12)"
+                            : "transparent",
+                          color: isActive ? "#1d4ed8" : "#475569",
+                          cursor: "pointer",
+                          fontFamily: "inherit",
+                          fontSize: entry.level === 1 ? 12 : 11,
+                          fontWeight: isActive ? 700 : 500,
+                          textAlign: "start",
+                          transition: "background 0.12s ease, color 0.12s ease",
+                        }}
+                        onMouseEnter={(e) => {
+                          if (!isActive)
+                            (e.currentTarget as HTMLElement).style.background =
+                              "rgba(99,102,241,0.08)";
+                        }}
+                        onMouseLeave={(e) => {
+                          if (!isActive)
+                            (e.currentTarget as HTMLElement).style.background =
+                              "transparent";
+                        }}
+                      >
+                        {/* Vertical color stripe — the "line" of the row */}
+                        <span
+                          aria-hidden
+                          style={{
+                            display: "block",
+                            width: 3,
+                            height: 18,
+                            borderRadius: 2,
+                            background: stripeColor,
+                            opacity: isActive ? 1 : 0.55,
+                            flexShrink: 0,
+                          }}
+                        />
+                        <span
+                          style={{
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            flex: 1,
+                          }}
+                        >
+                          {text}
+                        </span>
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+
+            {/* Collapsed: vertical dot indicator per heading */}
+            {tocCollapsed && (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 6,
+                  paddingTop: 4,
+                }}
+              >
+                {tocEntries.map((entry) => {
+                  const isActive = activeHeadingId === entry.id;
+                  const dotColor =
+                    entry.level === 1
+                      ? "#4338ca"
+                      : entry.level === 2
+                      ? "#0284c7"
+                      : "#ea580c";
+                  return (
+                    <button
+                      key={entry.id}
+                      type="button"
+                      onClick={() => jumpToHeading(entry.id)}
+                      title={entry.text || "(بدون متن)"}
+                      aria-label={entry.text || "تیتر"}
+                      style={{
+                        display: "block",
+                        width: 10 + (3 - entry.level) * 4,
+                        height: 10 + (3 - entry.level) * 4,
+                        borderRadius: "50%",
+                        border: "none",
+                        background: dotColor,
+                        opacity: isActive ? 1 : 0.4,
+                        cursor: "pointer",
+                        padding: 0,
+                        marginInlineStart: (entry.level - 1) * 4,
+                        transition: "opacity 0.12s ease, transform 0.12s ease",
+                        transform: isActive ? "scale(1.25)" : "scale(1)",
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            )}
+          </aside>
+        )}
+
+      <main
+        style={{
+          width: "min(1020px, calc(94vw - 240px))",
+          margin: 0,
+          flex: "1 1 auto",
+          minWidth: 0,
         }}
       >
         {view === "edit" ? (
@@ -1772,7 +2442,15 @@ export default function Home() {
           style={{ display: "none" }}
           onChange={handleTxtChosen}
         />
+        <input
+          ref={jsonInputRef}
+          type="file"
+          accept=".json,application/json"
+          style={{ display: "none" }}
+          onChange={handleJsonChosen}
+        />
       </main>
+      </div>
 
       {/* ===== Footer ===== */}
       <footer
